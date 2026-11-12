@@ -964,29 +964,10 @@ void loop() {
           Serial.print(F("длительность точки ")); Serial.print(CW_DOT_TIME_MS); Serial.println(F(" мс"));
         }
         
-        // ШАГ 1: Передача позывного и локатора
-        if (!pc_file_written && !soft_restart_flag) {
-          Serial.print(F("[ЭФИР_CW] Вызов: "));
-          send_cw_string("VVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " ");
-        }
-        
-        // ШАГ 2: Передача основного текста
+        // Передача основного текста
         if (!pc_file_written && !soft_restart_flag) {
           Serial.print(F("[ЭФИР_CW] Текст: "));
           send_cw_string(my_text_variable + " ");
-        }
-        
-        // ШАГ 3: Передача первой телеметрии
-        if (!pc_file_written && !soft_restart_flag) {
-          String telemetry = get_telemetry_string();
-          Serial.print(F("[ЭФИР_CW] Телем: "));
-          send_cw_string(telemetry);
-        }
-        
-        // ШАГ 5: Завершение передачи
-        if (!pc_file_written && !soft_restart_flag) {
-          Serial.print(F("[ЭФИР_CW] Конец: "));
-          send_cw_string("OVER.");
         }
         
         // Считаем, сколько полных секунд длился сеанс
@@ -1052,30 +1033,11 @@ void loop() {
         Serial.print(F("  частота: ")); Serial.print(rtty_mark_hz); Serial.println(F(" Гц"));  
         Serial.print(F("  разнос: ")); Serial.print(rtty_shift_hz); Serial.println(F(" Гц"));  
         Serial.print(F("  инверсия: ")); Serial.println(rtty_invert ? F("да") : F("нет"));  
-          
-        // ШАГ 1: RTTY передача позывного и локатора
-        if (!pc_file_written && !soft_restart_flag) {
-          Serial.print(F("[ЭФИР_RTTY] Вызов: "));
-          send_rtty_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n");
-        }
         
-        // ШАГ 2: RTTY передача основного текста
+        // RTTY передача основного текста
         if (!pc_file_written && !soft_restart_flag) {
           Serial.print(F("[ЭФИР_RTTY] Текст: "));
           send_rtty_string(my_text_variable + " ");
-        }
-        
-        // ШАГ 3: RTTY передача первой телеметрии
-        if (!pc_file_written && !soft_restart_flag) {
-          String telemetry = get_telemetry_string();
-          Serial.print(F("[ЭФИР_RTTY] Телем: "));
-          send_rtty_string(telemetry);
-        }
-        
-        // ШАГ 5: RTTY завершение передачи
-        if (!pc_file_written && !soft_restart_flag) {
-          Serial.print(F("[ЭФИР_RTTY] Конец: "));
-          send_rtty_string("OVER.\r\n\r\n");
         }
         
         // Строка лога выводится СТРОГО при штатном завершении сеанса
@@ -1132,45 +1094,10 @@ void loop() {
         // Вывод параметров IFKP
         prepare_ifkp_frequencies(ifkp_hz);
         
-        // IFKP: передача стартовой калибровочной лесенки (33 тона)
-        if (!pc_file_written && !soft_restart_flag) {
-          Serial.print(F("[ЭФИР_IFKP] Калибровочная лесенка "));
-          // Вызываем готовую безопасную функцию из модема
-          // send_ifkp_calibration_ladder(); 
-          Serial.println(F("ОК"));
-        }
-        
-        // IFKP: передача позывного и локатора
-        if (!pc_file_written && !soft_restart_flag) {
-          Serial.print(F("[ЭФИР_IFKP] Вызов: "));
-          send_ifkp_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n"); 
-        }
-        
-        // IFKP: передача стартовой калибровочной лесенки (33 тона)
-        if (!pc_file_written && !soft_restart_flag) {
-          Serial.print(F("[ЭФИР_IFKP] Калибровочная лесенка "));
-          // Вызываем готовую безопасную функцию из модема
-          // send_ifkp_calibration_ladder(); 
-          Serial.println(F("ОК"));
-        }
-        
         // IFKP: передача основного текста
         if (!pc_file_written && !soft_restart_flag) {
           Serial.print(F("[ЭФИР_IFKP] Текст: "));
           send_ifkp_string(my_text_variable + "\r\n"); 
-        }
-        
-        // IFKP: передача первой телеметрии
-        if (!pc_file_written && !soft_restart_flag) {
-          String telemetry = get_telemetry_string();
-          Serial.print(F("[ЭФИР_IFKP] Телем: "));
-          send_ifkp_string(telemetry);
-        }
-        
-        // IFKP завершение передачи
-        if (!pc_file_written && !soft_restart_flag) {
-          Serial.print(F("[ЭФИР_IFKP] Конец: "));
-          send_ifkp_string("OVER.\r\n\r\n");
         }
         
         // Выводим информацию о длительности ТОЛЬКО при успешном и полном цикле сеанса
@@ -1225,29 +1152,10 @@ void loop() {
   
         prepare_olivia_frequencies(olivia_hz);  
   
-        // OLIVIA: позывной и локатор  
-        if (!pc_file_written && !soft_restart_flag) {  
-          Serial.print(F("[ЭФИР_OLIVIA] Вызов: "));  
-          olivia_send_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n");  
-        }  
-  
         // OLIVIA: основной текст  
         if (!pc_file_written && !soft_restart_flag) {  
           Serial.print(F("[ЭФИР_OLIVIA] Текст: "));  
           olivia_send_string(my_text_variable + "\r\n");  
-        }  
-  
-        // OLIVIA: первая телеметрия  
-        if (!pc_file_written && !soft_restart_flag) {  
-          String telemetry = get_telemetry_string();  
-          Serial.print(F("[ЭФИР_OLIVIA] Телем: "));  
-          olivia_send_string(telemetry);  
-        }  
-  
-        // OLIVIA: завершение  
-        if (!pc_file_written && !soft_restart_flag) {  
-          Serial.print(F("[ЭФИР_OLIVIA] Конец: "));  
-          olivia_send_string("OVER.\r\n\r\n");  
         }  
   
         if (!pc_file_written && !soft_restart_flag) {  
@@ -1301,24 +1209,8 @@ void loop() {
         prepare_contestia_frequencies(contestia_hz);    
     
         if (!pc_file_written && !soft_restart_flag) {    
-          Serial.print(F("[ЭФИР_CONTESTIA] Вызов: "));    
-          contestia_send_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n");    
-        }    
-    
-        if (!pc_file_written && !soft_restart_flag) {    
           Serial.print(F("[ЭФИР_CONTESTIA] Текст: "));    
           contestia_send_string(my_text_variable + "\r\n");    
-        }    
-    
-        if (!pc_file_written && !soft_restart_flag) {    
-          String telemetry = get_telemetry_string();    
-          Serial.print(F("[ЭФИР_CONTESTIA] Телем: "));    
-          contestia_send_string(telemetry);    
-        }    
-    
-        if (!pc_file_written && !soft_restart_flag) {    
-          Serial.print(F("[ЭФИР_CONTESTIA] Конец: "));    
-          contestia_send_string("OVER.\r\n\r\n");    
         }    
     
         if (!pc_file_written && !soft_restart_flag) {    
@@ -1371,29 +1263,10 @@ void loop() {
   
         prepare_thor_frequencies(thor_hz);  
   
-        // THOR: позывной и локатор  
-        if (!pc_file_written && !soft_restart_flag) {  
-          Serial.print(F("[ЭФИР_THOR] Вызов: "));  
-          thor_send_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n");  
-        }  
-  
         // THOR: основной текст  
         if (!pc_file_written && !soft_restart_flag) {  
           Serial.print(F("[ЭФИР_THOR] Текст: "));  
           thor_send_string(my_text_variable + "\r\n");  
-        }  
-  
-        // THOR: первая телеметрия  
-        if (!pc_file_written && !soft_restart_flag) {  
-          String telemetry = get_telemetry_string();  
-          Serial.print(F("[ЭФИР_THOR] Телем: "));  
-          thor_send_string(telemetry);  
-        }  
-  
-        // THOR: завершение  
-        if (!pc_file_written && !soft_restart_flag) {  
-          Serial.print(F("[ЭФИР_THOR] Конец: "));  
-          thor_send_string("OVER.\r\n\r\n");  
         }  
   
         if (!pc_file_written && !soft_restart_flag) {  
@@ -1446,29 +1319,10 @@ void loop() {
   
         prepare_mfsk16_frequencies(mfsk16_hz);  
   
-        // MFSK16: позывной и локатор  
-        if (!pc_file_written && !soft_restart_flag) {  
-          Serial.print(F("[ЭФИР_MFSK16] Вызов: "));  
-          mfsk16_send_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n");  
-        }  
-  
         // MFSK16: основной текст  
         if (!pc_file_written && !soft_restart_flag) {  
           Serial.print(F("[ЭФИР_MFSK16] Текст: "));  
           mfsk16_send_string(my_text_variable + "\r\n");  
-        }  
-  
-        // MFSK16: первая телеметрия  
-        if (!pc_file_written && !soft_restart_flag) {  
-          String telemetry = get_telemetry_string();  
-          Serial.print(F("[ЭФИР_MFSK16] Телем: "));  
-          mfsk16_send_string(telemetry);  
-        }  
-  
-        // MFSK16: завершение  
-        if (!pc_file_written && !soft_restart_flag) {  
-          Serial.print(F("[ЭФИР_MFSK16] Конец: "));  
-          mfsk16_send_string("OVER.\r\n\r\n");  
         }  
   
         if (!pc_file_written && !soft_restart_flag) {  
@@ -1521,29 +1375,10 @@ void loop() {
   
         prepare_dominoex_frequencies(dominoex_hz);  
   
-        // DOMINOEX: позывной и локатор  
-        if (!pc_file_written && !soft_restart_flag) {  
-          Serial.print(F("[ЭФИР_DOMINOEX] Вызов: "));  
-          dominoex_send_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n");  
-        }  
-  
         // DOMINOEX: основной текст  
         if (!pc_file_written && !soft_restart_flag) {  
           Serial.print(F("[ЭФИР_DOMINOEX] Текст: "));  
           dominoex_send_string(my_text_variable + "\r\n");  
-        }  
-  
-        // DOMINOEX: первая телеметрия  
-        if (!pc_file_written && !soft_restart_flag) {  
-          String telemetry = get_telemetry_string();  
-          Serial.print(F("[ЭФИР_DOMINOEX] Телем: "));  
-          dominoex_send_string(telemetry);  
-        }  
-  
-        // DOMINOEX: завершение  
-        if (!pc_file_written && !soft_restart_flag) {  
-          Serial.print(F("[ЭФИР_DOMINOEX] Конец: "));  
-          dominoex_send_string("OVER.\r\n\r\n");  
         }  
   
         if (!pc_file_written && !soft_restart_flag) {  
@@ -1596,29 +1431,10 @@ void loop() {
   
         prepare_fsq_frequencies(fsq_hz);  
   
-        // FSQ: позывной и локатор  
-        if (!pc_file_written && !soft_restart_flag) {  
-          Serial.print(F("[ЭФИР_FSQ] Вызов: "));  
-          fsq_send_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n");  
-        }  
-  
         // FSQ: основной текст  
         if (!pc_file_written && !soft_restart_flag) {  
           Serial.print(F("[ЭФИР_FSQ] Текст: "));  
           fsq_send_string(my_text_variable + "\r\n");  
-        }  
-  
-        // FSQ: первая телеметрия  
-        if (!pc_file_written && !soft_restart_flag) {  
-          String telemetry = get_telemetry_string();  
-          Serial.print(F("[ЭФИР_FSQ] Телем: "));  
-          fsq_send_string(telemetry);  
-        }  
-  
-        // FSQ: завершение  
-        if (!pc_file_written && !soft_restart_flag) {  
-          Serial.print(F("[ЭФИР_FSQ] Конец: "));  
-          fsq_send_string("OVER.\r\n\r\n");  
         }  
   
         if (!pc_file_written && !soft_restart_flag) {  
@@ -1669,33 +1485,12 @@ void loop() {
         if (jtty_hz == 0) jtty_hz = 14079000;    
     
         prepare_jtty_frequencies(jtty_hz);
-    
-        // JTTY: позывной и локатор  
-        if (!pc_file_written && !soft_restart_flag) {
-          String call_msg = "VVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable;
-          Serial.print(F("[ЭФИР_JTTY] Вызов: ")); Serial.println(call_msg);  
-          jtty_send_string(call_msg.c_str());  
-        }
    
         // JTTY: основной текст (TEXT5-кадры)  
         if (!pc_file_written && !soft_restart_flag && my_text_variable.length() > 0) {    
           Serial.print(F("[ЭФИР_JTTY] Текст: ")); Serial.println(my_text_variable);  
           jtty_send_string(my_text_variable.c_str());
         }    
-
-        // JTTY: первая телеметрия  
-        if (!pc_file_written && !soft_restart_flag) {  
-          String telemetry = get_telemetry_string();
-          Serial.print(F("[ЭФИР_JTTY] Текст: ")); Serial.println(telemetry);  
-          jtty_send_string(telemetry.c_str());
-        }  
-
-        // JTTY: завершение  
-        if (!pc_file_written && !soft_restart_flag) {  
-          String over_msg = "OVER";
-          Serial.print(F("[ЭФИР_JTTY] Вызов: ")); Serial.println(over_msg);  
-          jtty_send_string(over_msg.c_str());  
-        }  
 
         if (!pc_file_written && !soft_restart_flag) {    
           uint32_t jtty_session_duration_sec = (millis() - jtty_session_start_ms) / 1000;    
@@ -1744,24 +1539,11 @@ void loop() {
   
         Serial.print(F("[AX25] 300 bd, AFSK 1200/2200, центр: "));  
         Serial.print(ax25_hz); Serial.println(F(" Гц"));  
-  
-        // ШАГ 1: позывной и локатор — один UI-frame  
-        if (!pc_file_written && !soft_restart_flag) {  
-          Serial.print(F("[ЭФИР_AX25] Вызов: "));  
-          send_ax25_packet("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n"); 
-        }  
 
         // ШАГ 2: основной текст  
         if (!pc_file_written && !soft_restart_flag) {  
           Serial.print(F("[ЭФИР_AX25] Текст: "));  
           send_ax25_packet(my_text_variable);  
-        }  
-  
-        // ШАГ 3: телеметрия  
-        if (!pc_file_written && !soft_restart_flag) {  
-          String telemetry = get_telemetry_string();  
-          Serial.print(F("[ЭФИР_AX25] Телем: "));  
-          send_ax25_packet(telemetry);  
         }  
   
         if (!pc_file_written && !soft_restart_flag) {  
