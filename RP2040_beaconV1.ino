@@ -116,12 +116,7 @@ UsrChainState usr_chain_state = USR_IDLE;  // Текущий статус авт
 uint32_t usr_timer_ms = 0;                 // Таймер неблокирующей паузы
 bool old_button_state = HIGH;              // Предыдущее состояние кнопки для отслеживания клика
 
-extern uint8_t rx_decoders_mode_by_name(const char* name);   // режим по имени, enum живёт в .cpp
-
 bool is_transmitting = false; // Флаг передачи 
-bool rx_active = false;       // Флаг приёма (заняты: LO, ADC, DMA, core1)  
-uint32_t rx_freq_hz = 0;      // частота, на которую настроен приёмник  
-uint8_t  rx_mode  = 0;        // RX_MODE_*
 
 bool soft_restart_flag = false;
 static bool wd_reboot_detected = false;
@@ -559,7 +554,7 @@ void check_serial_commands() {
 
           else if (command.length() > 5 &&  
                    command.substring(0,5).equalsIgnoreCase("jtty ")) {
-              if (is_transmitting || rx_active) {  
+              if (is_transmitting) {  
                   Serial.println(F("ОШИБКА: передатчик занят или идёт приём"));  
               } else {  
                   String txt = command.substring(5); txt.trim();  
@@ -576,79 +571,6 @@ void check_serial_commands() {
                       is_transmitting = false;
                   }  
               }  
-          }
-
-          else if (command.startsWith("iq ")) {  
-              dbg_iq = command.indexOf("on") >= 0;  
-              Serial.printf("[IQ] stream %s\n", dbg_iq ? "ON" : "OFF");  
-          }
-
-          // .ino, рядом с обработчиком "adc"  
-          else if (command == "adcr") {  
-              bool was_running = false;               // если есть флаг rx_running — используй его  
-              rx_capture_stop();                      // остановить DMA/ADC free-run  
-            
-              adc_init();  
-              adc_gpio_init(RX_ADC_PIN_I);  
-              adc_gpio_init(RX_ADC_PIN_Q);  
-            
-              adc_select_input(0);                    // ADC0 = GP26  
-              uint16_t v0 = adc_read();  
-              adc_select_input(1);                    // ADC1 = GP27  
-              uint16_t v1 = adc_read();  
-            
-              Serial.printf("[ADCR] ADC0(GP26)=%u  ADC1(GP27)=%u\n", v0, v1);  
-              // RX перезапусти вручную командой rx jtty после теста  
-          }
-
-          // Прямое чтение каналов в обход захвата (только при выключенном RX!)  
-          else if (command == "adcq") {  
-              adc_init();  
-              adc_gpio_init(RX_ADC_PIN_I);  
-              adc_gpio_init(RX_ADC_PIN_Q);  
-              for (int ch = 0; ch < 2; ch++) {  
-                  adc_select_input(ch);  
-                  uint16_t mn = 0xFFFF, mx = 0;  
-                  for (int i = 0; i < 200; i++) {  
-                      uint16_t v = adc_read();  
-                      if (v < mn) mn = v; if (v > mx) mx = v;  
-                  }  
-                  Serial.printf("[ADCQ] ch%d (GP%d): %u..%u\n", ch, 26 + ch, mn, mx);  
-              }  
-          }
-
-          else if (command.startsWith("adc")) {  
-              const volatile uint32_t* blk = NULL;  
-              uint32_t t0 = millis();  
-              while (!blk && millis() - t0 < 100) blk = rx_capture_get_block();  
-            
-              if (!blk) {  
-                  Serial.println(F("[ADC] блоков нет — rx запущен?"));  
-              } else {  
-                  Serial.print(F("[ADC] raw:"));  
-                  for (int k = 0; k < 8; k++)  
-                      Serial.printf(" %08lX", (unsigned long)blk[k]);  
-                  Serial.println();  
-            
-                  int lo_i = 4095, hi_i = 0, lo_q = 4095, hi_q = 0;  
-                  int64_t si = 0, sq = 0;  
-                  const int npairs = RX_BLOCK_SAMPLES;  
-                  for (int k = 0; k < npairs; k++) {  
-                      int i = blk[k] & 0xFFFF;          // [15:0]  = I (ADC0)  
-                      int q = blk[k] >> 16;             // [31:16] = Q (ADC1)  
-                      if (i < lo_i) lo_i = i; if (i > hi_i) hi_i = i; si += i;  
-                      if (q < lo_q) lo_q = q; if (q > hi_q) hi_q = q; sq += q;  
-                  }  
-                  Serial.printf("[ADC] I: %d..%d mid=%ld  Q: %d..%d mid=%ld  drop=%lu\n",  
-                      lo_i, hi_i, (long)(si/npairs),  
-                      lo_q, hi_q, (long)(sq/npairs),  
-                      (unsigned long)rx_capture_dropped());  
-                  rx_capture_release();  
-              }  
-              Serial.printf("[ADC] fcs=0x%08lX cs=0x%08lX rrobin=0x%02lX\n",  
-                  (unsigned long)adc_hw->fcs,  
-                  (unsigned long)adc_hw->cs,  
-                  (unsigned long)((adc_hw->cs >> 16) & 0x1F));  
           }
 
           // Ручной прогон кодов: "bpf 0..15" — выставить код, "bpf" — показать текущий  
@@ -987,7 +909,7 @@ void loop() {
   // Проверяем, кратна ли текущая секунда 5
   if (rtc_sec % 5 == 0 && rtc_sec != last_printed_sec) {
     // Проверяем условия: отсутствие эфира и активности
-    if (!pc_activity_detected && !soft_restart_flag && !is_transmitting && !rx_active) {
+    if (!pc_activity_detected && !soft_restart_flag && !is_transmitting) {
       last_printed_sec = rtc_sec; // Запоминаем секунду, блокируя повторные вызовы внутри нее
       
       update_scheduler();
