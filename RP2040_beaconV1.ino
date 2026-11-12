@@ -1,0 +1,2703 @@
+﻿/**
+ * ============================================================================
+ *  RP2040_beacon.ino — Главный диспетчер и инициализация радиомаяка
+ *  Версия 2.26 от 2026-10-15, автор RU0AOG
+ * ============================================================================
+ *  
+ *  НАЗНАЧЕНИЕ
+ *  ----------
+ *  Ядро прошивки автоматического КВ/УКВ-радиомаяка: связывает все модули  
+ *  (генератор, модуляторы, часы, датчики, дисплей, индикацию, файловую систему)  
+ *  и по расписанию выводит в эфир сообщения тремя режимами — IFKP, RTTY, CW.  
+ *  ВЧ-сигнал формируется либо внешним синтезатором Si5351, либо аварийным  
+ *  программным DDS-генератором на PIO RP2040 (vfo_hardware) при отсутствии чипа. 
+ *  
+ *  АРХИТЕКТУРА И ГЛАВНЫЙ ЦИКЛ (loop)  
+ *  ---------------------------------  
+ *  1. Системный такт (250 мс): опрос и обновление системного времени (RTC).  
+ *  2. Вывод статуса (раз в 5 сек): обновление данных на LCD (температура  
+ *     CPU, датчика, давление, время) и короткий зеленый проблеск ZERO_LED.  
+ *  3. Обработка CLI и MSC: опрос команд консоли и контроль активности ПК.  
+ *  4. Мягкий перезапуск (soft_restart_flag): мгновенное прерывание эфира,  
+ *     перечитывание INFO.TXT из ОЗУ-диска и сброс автоматов без перезапуска CPU.  
+ *  5. Автомат кнопки USR (GP24): неблокирующий сквозной запуск сеансов  
+ *     CW -> RTTY -> IFKP с паузами по 15 сек и жестким удержанием блокировки  
+ *     планировщика (is_transmitting = true).  
+ *  
+ *  СТРУКТУРА СЕАНСА ПЕРЕДАЧИ (одинакова для всех режимов)  
+ *  -----------------------------------------------------  
+ *  SI_POWER_ON -> подготовка частот -> позывной/локатор -> текст ->  
+ *  телеметрия (системная + климатическая) -> "OVER" -> SI_POWER_OFF.  
+ *  Каждый шаг обёрнут проверкой (!pc_file_written && !soft_restart_flag) —  
+ *  это механизм экстренного прерывания эфира от ПК или команды STOP.  
+ *  
+ *  АВТООПРЕДЕЛЕНИЕ ОБОРУДОВАНИЯ (I2C_Scanner / scanRP2040Ports)  
+ *  -----------------------------------------------------------  
+ *  При старте сканируются обе шины I2C (i2c0 и i2c1) по всем допустимым парам  
+ *  пинов SDA/SCL с исключением GPIO16/23/24/25 (RGB-светодиод и отсутствующие  
+ *  пины). Найденные приборы (Si5351 0x60, DS3231/DS1307 0x68, AT24Cxx 0x50-0x57,  
+ *  LCD 0x27, BME/BMP280 0x76, BMP180 0x77) заносятся в таблицы device_*[5]  
+ *  (формат: [активен, № шины, SDA, SCL, адрес]). Тип RTC и объём EEPROM  
+ *  определяются активными тестами записи/чтения регистров.  
+ *  
+ *  КОНСОЛЬНЫЕ КОМАНДЫ (check_serial_commands)  
+ *  ------------------------------------------  
+ *    ? / tele / time / date / text / setparam M=V /  
+ *    start cw|rtty|ifkp|olivia|contestia|thor|mfsk16|dominoex|fsq / stop / restart / reset / help.  
+ *  
+ *  ЭМУЛЯТОР HAYES-МОДЕМА (hayes_modem)  
+ *  -----------------------------------  
+ *  Второй виртуальный COM-порт принимает AT-команды; ATD<режим> "соединяет"  
+ *  с эфиром (0 петля, 1 CW, 2 RTTY, 3 IFKP, 4 OLIVIA, 5 THOR, 6 CONTESTIA, 7 MFSK16,
+ *  8 DOMINOEX, 9 FSQ), после CONNECT  
+ *  каждая строка передаётся в эфир. Опрос — hayes_modem_poll() в loop().  
+ *  
+ *  ГЛОБАЛЬНОЕ СОСТОЯНИЕ:  
+ *    device_SI/DS/BM/AT/DL[5]  — таблицы найденного оборудования.  
+ *    soft_restart_flag, pc_file_written, is_transmitting — флаги управления.  
+ *    BCN_VER / BCN_DAT          — версия и дата прошивки.
+ *  
+ *  ИСПОЛЬЗУЕМЫЕ БИБЛИОТЕКИ И МОДУЛИ  
+ *  -------------------------------  
+ *  - Adafruit TinyUSB Library (MIT): Adafruit_USBD_MSC/CDC — USB-стек  
+ *  - Raspberry Pi Pico SDK (BSD-3): hardware/watchdog.h (watchdog 15 сек),  
+ *    hardware/adc.h (датчик температуры CPU, канал 4)  
+ *  - Arduino core RP2040 (LGPL-2.1): Serial, Wire/TwoWire, String,  
+ *    snprintf, micros(), GPIO  
+ *  - Модули проекта: file_manager.h, si5351_driver.h, scheduler.h,  
+ *    cw_modem.h, rtty_modem.h, ifkp_modem.h, olivia_modem.h,  
+ *    thor_modem.h, hayes_modem.h, bme280.h, lcd.h, led_blink.h,  
+ *    climate_log.h, vfo_hardware.h  
+ *  - Сторонний код отсутствует: диспетчер, I2C-сканер оборудования  
+ *    и обработчик консольных команд — оригинальная разработка автора.  
+ *  
+ *  Этот файл — часть RP2040_beacon, распространяется под GPLv3  
+ *  (см. LICENSE в корне репозитория).  
+ * ============================================================================  
+ */
+
+#include "rx_spectrum.h"
+#include "file_manager.h"
+#include "si5351_driver.h"
+#include "scheduler.h"
+#include "cw_modem.h"
+#include "rtty_modem.h"
+#include "ifkp_modem.h"
+#include "olivia_modem.h"
+#include "thor_modem.h"
+#include "jtty_modem.h"
+#include "ax25_modem.h"   // после jtty_modem.h
+#include "hayes_modem.h"
+#include "bme280.h"
+#include "lcd.h"
+#include "led_blink.h"
+#include "climate_log.h"
+#include <hardware/watchdog.h>
+#include <hardware/adc.h>
+#include "vfo_hardware.h"
+#include <Adafruit_TinyUSB.h>
+
+String BCN_VER = "2.26";
+String BCN_DAT = "2026-10-15";
+
+bool dev_TX_state  = false;
+
+// таблица параметров устройств
+/*
+  device_BM[0] = 1;
+  device_BM[1] = WIRE_NO;
+  device_BM[2] = PIN_SDA;
+  device_BM[3] = PIN_SCL;
+  device_BM[4] = address;  */
+uint8_t device_SI[5];
+uint8_t device_DS[5];
+uint8_t device_BM[5];
+uint8_t device_AH[5];
+uint8_t device_AT[5];
+uint8_t device_DL[5];
+
+String device_SI_name = "SI5351 Генератор";
+String device_DS_name = "DS3231 Часы RTC";
+String device_BM_name = "BME280 Барометр";
+String device_AH_name = "AHT20  Гигрометр";
+String device_AT_name = "EEPROM AT24C";
+String device_DL_name = "дисплей LCD1602/1604";
+
+bool force_cw_transmission   = false;   // Флаг ручного запуска CW
+bool force_rtty_transmission = false;   // Флаг ручного запуска RTTY
+bool force_ifkp_transmission = false;   // Флаг ручного запуска IFKP
+bool force_olivia_transmission = false; // Флаг ручного запуска OLIVIA
+bool force_contestia_transmission = false; // Флаг ручного запуска CONTESTIA
+bool force_thor_transmission = false;   // Флаг ручного запуска THOR
+bool force_mfsk16_transmission = false;   // Флаг ручного запуска MFSK16
+bool force_dominoex_transmission = false; // Флаг ручного запуска DOMINOEX
+bool force_fsq_transmission = false;      // Флаг ручного запуска FSQ
+bool force_jtty_transmission = false;     // Флаг ручного запуска JTTY
+bool force_ax25_transmission = false;     // Флаг ручного запуска AX.25
+volatile bool system_ready = false;     // Флаг готовности: setup() полностью отработал, баннер напечатан 
+
+extern volatile bool tx_launching; 
+extern PllConfig pll_overclock;   // из vfo_hardware.cpp
+extern void jtty_send_string(const char* str);  
+extern void prepare_jtty_frequencies(uint32_t base_hz);
+extern bool dbg_rx;
+extern bool dbg_iq;
+
+// --- НАСТРОЙКИ АВТОМАТА КНОПКИ USR ---
+const uint8_t PIN_USR_BUTTON = 24; // Системный пин кнопки BOOT/USR на большинстве плат RP2040
+
+enum UsrChainState {
+  USR_IDLE,          // Ожидание нажатия кнопки
+  USR_START_CW,      // Запуск и выполнение сеанса CW
+  USR_WAIT_FOR_RTTY, // 15-секундная пауза перед RTTY
+  USR_START_RTTY,    // Запуск и выполнение сеанса RTTY
+  USR_WAIT_FOR_IFKP, // 15-секундная пауза перед IFKP
+  USR_START_IFKP,    // Запуск и выполнение сеанса IFKP
+  USR_CLOSE_CHAIN    // Финальная стадия освобождения шины после IFKP
+};
+
+UsrChainState usr_chain_state = USR_IDLE;  // Текущий статус автомата последовательности
+uint32_t usr_timer_ms = 0;                 // Таймер неблокирующей паузы
+bool old_button_state = HIGH;              // Предыдущее состояние кнопки для отслеживания клика
+
+// Приёмный тракт  
+void     rx_capture_start(void);
+void     rx_capture_stop(void);  
+void     rx_dsp_start(float f_target_hz);  
+void     rx_dsp_stop(void);
+bool     rx_dsp_get_output(const int16_t** i, const int16_t** q, uint8_t* n);
+void     rx_dsp_release_output(void);
+float    rx_dsp_fs_out(void);
+void     rx_decoders_start(uint8_t mode, float center_hz);
+void     rx_decoders_process(const int16_t* xi, const int16_t* xq, uint8_t n);
+void     rx_decoders_stop(void);  
+uint32_t vfo_quadrature_lo_hz(void);  
+void     ZERO_LED_CYAN_ON(void);  
+void     ZERO_LED_OFF(void);  
+void     usb_audio_set_enable(bool en);   // usb_audio.cpp: UAC-микрофон, тап xi на core1
+
+extern uint8_t rx_decoders_mode_by_name(const char* name);   // режим по имени, enum живёт в .cpp
+
+bool is_transmitting = false; // Флаг передачи 
+bool rx_active = false;       // Флаг приёма (заняты: LO, ADC, DMA, core1)  
+uint32_t rx_freq_hz = 0;      // частота, на которую настроен приёмник  
+uint8_t  rx_mode  = 0;        // RX_MODE_*
+
+bool soft_restart_flag = false;
+static bool wd_reboot_detected = false;
+extern bool pc_activity_detected; 
+String rtc_chip_name = "Неизвестный RTC"; // Сюда сканер запишет точное имя чипа
+
+extern uint8_t rtc_sec;
+
+// Функция проверки и обработки текстовых команд с локальным эхом
+extern void update_info_config_from_console(String marker, String new_value);
+
+void jtty_selftest(void);   // jtty_modem.cpp
+extern void jtty_selftest_pack();
+
+void check_serial_commands() {  
+  static char cmd_buffer[64];  
+  static size_t buf_idx = 0;  
+  static uint32_t last_input_ms = 0;   // время последнего принятого символа  
+  static bool reminder_shown = false;  // защёлка, чтобы напоминание не повторялось
+
+  // Цикл работает, пока не вычитает ВСЕ доступные символы из UART
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+
+    last_input_ms = millis();  
+    reminder_shown = false;   // новый ввод — сбрасываем защёлку
+
+    if (c == '\n' || c == '\r') {
+      if (buf_idx > 0) {
+        cmd_buffer[buf_idx] = '\0'; 
+        String command = String(cmd_buffer); 
+        // Сразу сбрасываем буфер, так как команда скопирована в String
+        buf_idx = 0; 
+
+        command.trim(); 
+
+        if (command.length() > 0) {
+          // перевести строку и вывести введённую команду
+          Serial.print(F("\r\n> "));
+          Serial.println(command);
+          
+          LCD_print("                    ", 1, 0);
+          LCD_print(">"+command, 1, 0);
+
+          if (command.equalsIgnoreCase("?")) {
+            print_current_settings();
+            print_current_date();
+            print_current_time();
+            Serial.print(F("Телеметрия: ")); Serial.println(get_telemetry_string());
+            if (device_BM[0] == 1) {
+            Serial.print(F("Телеметрия: ")); Serial.println(get_climate_telemetry());
+            }
+            else {
+            Serial.print(F("Телеметрия: ")); Serial.println("в системе отсутствует датчик давления");
+            }
+            Serial.println(F("Введите help для перехода в справочное меню по командам управления"));
+          }
+          else if (command.equalsIgnoreCase("TELE")) {
+            print_current_time();
+            Serial.print(F("Телеметрия: ")); Serial.println(get_telemetry_string());
+            if (device_BM[0] == 1) {
+            Serial.print(F("Телеметрия: ")); Serial.println(get_climate_telemetry());
+            }
+            else {
+            Serial.print(F("Телеметрия: ")); Serial.println("в системе отсутствует датчик давления");
+            }
+          }
+          else if (command.startsWith("time")) {
+            int space_idx = command.indexOf(' ');
+            if (space_idx == -1) {
+              print_current_date();
+              print_current_time();
+            } else {
+              handle_time_command(command);
+            }
+          }
+          else if (command.startsWith("date")) {
+            handle_date_command(command);
+          }
+          else if (command.equalsIgnoreCase("RESTART") || command.equalsIgnoreCase("STOP")) {
+            if (command.equalsIgnoreCase("RESTART")) {
+              Serial.println(F("[!] МЯГКИЙ ПЕРЕЗАПУСК МАЯКА..."));
+              pc_file_written = true;
+              LCD_init(true);
+              LCD_print(">> RESTART <<", 0, 0);
+            } else {
+              Serial.println(F("[!] Экстренная остановка передачи"));
+              LCD_print("STOP TRANSMIT!!!", 0, 0);
+            }
+            Serial.flush();
+            soft_restart_flag = true;
+          }
+          else if (command.equalsIgnoreCase("RESET")) {
+            Serial.println(F("[!] КРИТИЧЕСКИЙ ЖЕСТКИЙ СБРОС ПРОЦЕССОРА..."));
+            LCD_init(true);
+            LCD_print(">> CPU RESET <<", 0, 0);
+            // Пишем в файл на виртуальную флешку историю работы
+            log_file_write_line("рестарт процессора по команде оператора");
+            SI_POWER_OFF();
+            Serial.println(F("***"));
+            Serial.println(F(""));
+            Serial.flush();
+            delay(500);
+            watchdog_reboot(0, 0, 0);
+          }
+          else if (command.startsWith("text")) {
+            int space_idx = command.indexOf(' ');
+            if (space_idx == -1) {
+              Serial.println(F("=== ТЕКУЩИЙ ТЕКСТ РАДИОПЕРЕДАЧИ МАЯКА ==="));
+              Serial.print(F("Текст: ")); 
+              Serial.println(my_text_variable.length() > 0 ? my_text_variable : F("Не задан"));
+              Serial.println(F("========================================="));
+            } else {
+              String new_txt = command.substring(space_idx + 1);
+              new_txt.trim();
+              if (new_txt.length() > 0) {
+                update_info_config_from_console("TEXT", new_txt);
+              } else {
+                Serial.println(F("[Ошибка] Текст для записи пустой."));
+              }
+            }
+          }
+          else if (command.equalsIgnoreCase("START CW")) {  
+            if (is_transmitting) {  
+              Serial.println(F("[Ошибка] Сейчас уже идет трансляция!"));  
+            } else {  
+              update_scheduler();  
+              uint32_t cw_hz = (my_freq_cw_var.length() > 0) ? strtoul(my_freq_cw_var.c_str(), NULL, 10) : 3601000;  
+              if (cw_hz == 0) cw_hz = 3601000;  
+              char buf[148];  
+              snprintf(buf, sizeof(buf),  
+                      "[Система] %02d:%02d:%02d - Заявка принята. Выходим в эфир CW на частоте %s Гц...",  
+                      rtc_hour, rtc_min, rtc_sec, format_freq(cw_hz).c_str());  
+              Serial.println(buf);  
+              force_cw_transmission = true;  
+            }  
+          }
+          else if (command.equalsIgnoreCase("START RTTY")) {  
+            if (is_transmitting) {  
+              Serial.println(F("[Ошибка] Сейчас уже идет трансляция!"));  
+            } else {  
+              update_scheduler();  
+              uint32_t rtty_hz = strtoul(my_rtty_mark_var.c_str(), NULL, 10);  
+              if (rtty_hz == 0) rtty_hz = 3601585;  
+              char buf[148];  
+              snprintf(buf, sizeof(buf),  
+                      "[Система] %02d:%02d:%02d - Заявка принята. Выходим в эфир RTTY на частоте %s Гц...",  
+                      rtc_hour, rtc_min, rtc_sec, format_freq(rtty_hz).c_str());  
+              Serial.println(buf);  
+              force_rtty_transmission = true;  
+            }  
+          }
+          else if (command.equalsIgnoreCase("START IFKP")) {  
+            if (is_transmitting) {  
+              Serial.println(F("[Ошибка] Сейчас уже идет трансляция!"));  
+            } else {  
+              update_scheduler();  
+              uint32_t ifkp_hz = strtoul(my_freq_ifkp_var.c_str(), NULL, 10);  
+              if (ifkp_hz == 0) ifkp_hz = 3601307;  
+              char buf[148];  
+              snprintf(buf, sizeof(buf),  
+                      "[Система] %02d:%02d:%02d - Заявка принята. Выходим в эфир IFKP-0.5 на частоте %s Гц...",  
+                      rtc_hour, rtc_min, rtc_sec, format_freq(ifkp_hz).c_str());  
+              Serial.println(buf);  
+              force_ifkp_transmission = true;  
+            }  
+          }
+          else if (command.equalsIgnoreCase("START OLIVIA")) {  
+            if (is_transmitting) {  
+              Serial.println(F("[Ошибка] Сейчас уже идет трансляция!"));  
+            } else {  
+              update_scheduler();  
+              uint32_t olivia_hz = strtoul(my_freq_olivia_var.c_str(), NULL, 10);  
+              if (olivia_hz == 0) olivia_hz = 3601307;  
+              char buf[148];  
+              snprintf(buf, sizeof(buf),  
+                      "[Система] %02d:%02d:%02d - Заявка принята. Выходим в эфир OLIVIA 8/250 на частоте %s Гц...",  
+                      rtc_hour, rtc_min, rtc_sec, format_freq(olivia_hz).c_str());  
+              Serial.println(buf);  
+              force_olivia_transmission = true;  
+            }  
+          }
+
+          else if (command.equalsIgnoreCase("START CONTESTIA") || command.equalsIgnoreCase("START CONT") || command.equalsIgnoreCase("START CONTEST")) {  
+            if (is_transmitting) {  
+              Serial.println(F("[Ошибка] Сейчас уже идет трансляция!"));  
+            } else {  
+              update_scheduler();  
+              uint32_t contestia_hz = strtoul(my_freq_contestia_var.c_str(), NULL, 10);  
+              if (contestia_hz == 0) contestia_hz = 3601307;  
+              char buf[148];  
+              snprintf(buf, sizeof(buf),  
+                      "[Система] %02d:%02d:%02d - Заявка принята. Выходим в эфир CONTESTIA 8/250 на частоте %s Гц...",  
+                      rtc_hour, rtc_min, rtc_sec, format_freq(contestia_hz).c_str());  
+              Serial.println(buf);  
+              force_contestia_transmission = true;  
+            }  
+          }
+
+          else if (command.equalsIgnoreCase("START THOR")) {  
+            if (is_transmitting) {  
+              Serial.println(F("[Ошибка] Сейчас уже идет трансляция!"));  
+            } else {  
+              update_scheduler();  
+              uint32_t thor_hz = strtoul(my_freq_thor_var.c_str(), NULL, 10);  
+              if (thor_hz == 0) thor_hz = 3601307;  
+              char buf[148];  
+              snprintf(buf, sizeof(buf),  
+                      "[Система] %02d:%02d:%02d - Заявка принята. Выходим в эфир THOR 11 на частоте %s Гц...",  
+                      rtc_hour, rtc_min, rtc_sec, format_freq(thor_hz).c_str());  
+              Serial.println(buf);  
+              force_thor_transmission = true;  
+            }  
+          }
+          else if (command.equalsIgnoreCase("START MFSK16") || command.equalsIgnoreCase("START MFSK")) {  
+            if (is_transmitting) {  
+              Serial.println(F("[Ошибка] Сейчас уже идет трансляция!"));  
+            } else {  
+              update_scheduler();  
+              uint32_t mfsk16_hz = strtoul(my_freq_mfsk16_var.c_str(), NULL, 10);  
+              if (mfsk16_hz == 0) mfsk16_hz = 3601307;  
+              char buf[148];  
+              snprintf(buf, sizeof(buf),  
+                      "[Система] %02d:%02d:%02d - Заявка принята. Выходим в эфир MFSK16 на частоте %s Гц...",  
+                      rtc_hour, rtc_min, rtc_sec, format_freq(mfsk16_hz).c_str());  
+              Serial.println(buf);  
+              force_mfsk16_transmission = true;  
+            }  
+          }
+          else if (command.equalsIgnoreCase("START DOMINOEX") || command.equalsIgnoreCase("START DOMINO") || command.equalsIgnoreCase("START DOM")) {  
+            if (is_transmitting) {  
+              Serial.println(F("[Ошибка] Сейчас уже идет трансляция!"));  
+            } else {  
+              update_scheduler();  
+              uint32_t dominoex_hz = strtoul(my_freq_dominoex_var.c_str(), NULL, 10);  
+              if (dominoex_hz == 0) dominoex_hz = 3601307;  
+              char buf[148];  
+              snprintf(buf, sizeof(buf),  
+                      "[Система] %02d:%02d:%02d - Заявка принята. Выходим в эфир DOMINOEX 8 на частоте %s Гц...",  
+                      rtc_hour, rtc_min, rtc_sec, format_freq(dominoex_hz).c_str());  
+              Serial.println(buf);  
+              force_dominoex_transmission = true;  
+            }  
+          }
+          else if (command.equalsIgnoreCase("START FSQ")) {  
+            if (is_transmitting) {  
+              Serial.println(F("[Ошибка] Сейчас уже идет трансляция!"));  
+            } else {  
+              update_scheduler();  
+              uint32_t fsq_hz = strtoul(my_freq_fsq_var.c_str(), NULL, 10);  
+              if (fsq_hz == 0) fsq_hz = 3601307;  
+              char buf[148];  
+              snprintf(buf, sizeof(buf),  
+                      "[Система] %02d:%02d:%02d - Заявка принята. Выходим в эфир FSQ-4.5 на частоте %s Гц...",  
+                      rtc_hour, rtc_min, rtc_sec, format_freq(fsq_hz).c_str());  
+              Serial.println(buf);  
+              force_fsq_transmission = true;  
+            }  
+          }
+
+          else if (command.equalsIgnoreCase("START AX25")) {    
+            if (is_transmitting) {    
+              Serial.println(F("[Ошибка] Сейчас уже идет трансляция!"));    
+            } else {    
+              update_scheduler();    
+              uint32_t ax25_hz = strtoul(my_freq_ax25_var.c_str(), NULL, 10);    
+              if (ax25_hz == 0) ax25_hz = 14079000;    
+              char buf[148];    
+              snprintf(buf, sizeof(buf),    
+                      "[Система] %02d:%02d:%02d - Заявка принята. Выходим в эфир AX.25 300bd на частоте %s Гц...",    
+                      rtc_hour, rtc_min, rtc_sec, format_freq(ax25_hz).c_str());    
+              Serial.println(buf);    
+              force_ax25_transmission = true;    
+            }    
+          }
+
+
+          else if (command.startsWith("quad ")) {          // quad 3600000      
+              uint32_t f = strtoul(command.substring(5).c_str(), NULL, 10);      
+              if (f == 0) f = 3600000;      
+              if (is_transmitting) {      
+                  Serial.println(F("[Ошибка] Сейчас идет трансляция!"));      
+              } else {    
+                  Serial.println("запускаем квадратурный режим");    
+                  vfo_quadrature_start(f);      
+                  Serial.printf("[QUAD] LO = %lu Гц на GP1/GP2\n", (unsigned long)f);  
+                  vfo_quadrature_debug();   // этап 0: регистры PIO/пинов/клока  
+                  delay(20);  
+                  // второй замер — clk_sys после возможного boost  
+                  vfo_quadrature_debug();  
+              }      
+          }
+
+
+
+
+
+
+
+
+
+
+
+
+          else if (command.equalsIgnoreCase("quad")) {
+            vfo_quadrature_start(14100000);
+            quad_test(14100000);
+          }
+
+          else if (command.equalsIgnoreCase("quad off")) {    
+              // Должна идти ПЕРВОЙ — иначе startsWith("quad ") перехватит её  
+              uint32_t cw_hz = strtoul(my_freq_cw_var.c_str(), NULL, 10);    
+              if (cw_hz == 0) cw_hz = 3600000;  
+              Serial.println("возврат в обычный режим");  
+              vfo_quadrature_stop(cw_hz, 1.0);    
+              Serial.println(F("[QUAD] OFF"));    
+          }  
+          else if (command.startsWith("quad ")) {          // quad 3600000    
+              uint32_t f = strtoul(command.substring(5).c_str(), NULL, 10);    
+              if (f == 0) f = 3600000;    
+              if (is_transmitting) {    
+                  Serial.println(F("[Ошибка] Сейчас идет трансляция!"));    
+              } else {  
+                  Serial.println("запускаем квадратурный режим");  
+                  vfo_quadrature_start(f);    
+                  Serial.printf("[QUAD] LO = %lu Гц на GP1/GP2\n", (unsigned long)f);    
+              }    
+          }
+
+          else if (command.equalsIgnoreCase("rx off")) {    
+              // ПЕРВОЙ — иначе startsWith("rx ") перехватит    
+              if (!rx_active) {    
+                  Serial.println(F("[RX] Приёмник не был запущен"));    
+              } else {    
+                  if (rx_mode == 0xFF) {
+                    rx_spectrum_stop();
+                  } else {
+                    rx_decoders_stop();
+                  }
+                  rx_dsp_stop();          // сначала гасим потребителя буферов    
+                  rx_capture_stop();      // потом источник (DMA + ADC)    
+                  uint32_t cw_hz = strtoul(my_freq_cw_var.c_str(), NULL, 10);    
+                  if (cw_hz == 0) cw_hz = 3600000;    
+                  vfo_quadrature_stop(cw_hz, 1.0);  // LO выключаем последним  
+                  rx_active = false;    
+                  ZERO_LED_OFF();    
+                  Serial.println(F("[RX] OFF"));    
+              }  
+          }  
+
+
+          else if (command.startsWith("rx ")) {  
+            // rx <mode> [freq]  — пример: rx rtty 3601500  
+            if (is_transmitting || tx_launching) {  
+                Serial.println(F("[Ошибка] Идёт передача — приём заблокирован"));  
+            } else if (rx_active) {  
+                Serial.println(F("[Ошибка] Приёмник уже активен. Сначала: rx off"));  
+            } else {  
+                String rest = command.substring(3); rest.trim();  
+                int sp = rest.indexOf(' ');  
+                String mode_s = (sp < 0) ? rest : rest.substring(0, sp);  
+                uint32_t f = (sp < 0) ? 0 : strtoul(rest.substring(sp+1).c_str(), NULL, 10);  
+                if (f == 0) f = 3600000;  
+                mode_s.toLowerCase();  
+  
+                // 0xFF — специальный режим полного спектра, не режим декодера.
+                uint8_t mode = mode_s.equalsIgnoreCase("spec")
+                             ? 0xFF
+                             : rx_decoders_mode_by_name(mode_s.c_str());
+  
+                if (mode == 0) {  
+                    Serial.println(F("[RX] Неизвестный режим. Доступны: rtty cw olivia contestia thor mfsk16 dominoex fsq ifkp jtty"));  
+                } else {  
+                    // 1. LO: целочисленный clkdiv, дизеринг/core1 выключены  
+                    vfo_quadrature_start(f);  
+                    uint32_t lo = vfo_quadrature_lo_hz();  
+                    vfo_subband_apply(f);          // ДПФ по частоте команды rx  
+  
+                    // 2. DSP на core1: NCO садится на (f_target − f_lo_actual)  
+                    rx_dsp_start((float)f);  
+  
+                    // 3. ADC+DMA поток  
+                    rx_capture_start();  
+  
+                    // 4. Запускаем либо спектроанализатор, либо декодер.
+                    if (mode == 0xFF) {
+                      rx_spectrum_start(rx_dsp_fs_out());
+                    } else {
+                      rx_decoders_start(mode, (float)f);
+                    }
+  
+                    rx_active = true;  
+                    rx_freq_hz = f;  
+                    rx_mode = mode;  
+                    ZERO_LED_CYAN_ON();  
+                    Serial.printf("[RX] %s @ %lu Гц | LO=%lu Гц, IF=%.1f Гц\n",  
+                                  mode_s.c_str(), (unsigned long)f,  
+                                  (unsigned long)lo, (float)f - (float)lo);  
+                }  
+            }  
+        }
+
+          else if (command.equalsIgnoreCase("q")) {
+            uint32_t f = 3600000;
+            const char* mode_name = "rtty";
+            uint8_t mode = rx_decoders_mode_by_name(mode_name);
+            Serial.print("Запуск приёма на частоте "); Serial.println(f);
+            Serial.println("Старт квадратурного гетеродина:");
+            vfo_quadrature_start(f);
+            Serial.println("Включение диапазонного фильтра:");
+            vfo_subband_apply(f);
+            Serial.println("Запуск модуля DSP:");
+            rx_dsp_start((float)f);
+            Serial.println("Запуск потока АЦП:");
+            rx_capture_start();
+            Serial.print("Запуск модуля декодеров в режиме "); Serial.print(mode); Serial.print(" ("); Serial.print(mode_name); Serial.println(").");
+            rx_decoders_start(mode, (float)f);
+            Serial.print("Устанавливаем флаг активности приёмника...");
+            rx_active = true;
+            rx_freq_hz = f;  
+            rx_mode = mode;
+            Serial.println("ОК.");
+          }
+
+          else if (command.equalsIgnoreCase("clear log")) {
+            if (is_transmitting) {
+              Serial.println(F("[Ошибка] Нельзя стирать журнал во время активной передачи в эфир!"));
+            } else {
+              Serial.println(F("[Система] Запрос принят. Стираем LOG.TXT..."));
+              LCD_init(true);
+              LCD_print("CLEARING LOG...", 0, 0);
+              
+              log_file_clear(); // Вызов нашей новой функции очистки ОЗУ и Flash
+              
+              LCD_print("LOG FILE BLANK", 0, 0);
+              Serial.println(F("[Система] Журнал успешно очищен!"));
+              // Пишем в файл на виртуальную флешку историю работы
+              log_file_write_line("Лог очищен");
+            }
+          }
+          // ПРИНУДИТЕЛЬНЫЙ СБРОС ВСЕХ ФАЙЛОВ НА ДЕФОЛТ ---
+          else if (command.equalsIgnoreCase("format disk")) {
+            if (is_transmitting) {
+              Serial.println(F("[Ошибка] Нельзя форматировать диск во время активной передачи в эфир!"));
+            } else {
+              LCD_init(true);
+              LCD_print("FORMATTING DISK.", 0, 0);
+              
+              force_reset_to_default_disk(); // Вызов новой функции сброса
+              
+              LCD_print("DISK DEFAULT OK", 0, 0);
+              // Записываем событие в свежесозданный дефолтный лог
+              log_file_write_line("флэш-диск отформатирован. Все установки сброшены");
+            }
+          }
+
+          else if (command.equalsIgnoreCase("remount")) {  
+            Serial.println(F("[Система] Перемонтирование USB-диска..."));  
+            is_transmitting = false;                     // на всякий случай глушим эфир  
+            log_file_write_line("Перемонтирование диска по команде оператора");  
+            remount_usb_disk();
+            Serial.println(F("[Система] Диск перемонтирован."));  
+          }
+
+          // ПРАВКА: Новая команда мониторинга климатической таблицы
+          else if (command.equalsIgnoreCase("CLIM")) {
+            climate_print_table_to_console();
+          }
+          else if (command.equalsIgnoreCase("CLIM_TX")) {
+            climate_send_table_to_air();
+          }
+
+          else if (command.equalsIgnoreCase("modem")) {
+            hayes_modem_print_status();
+          }
+
+          else if (command.equalsIgnoreCase("sched") || command.equalsIgnoreCase("schedule")) {  
+            print_schedule();  
+          }
+
+          // === OCTEST: стресс-тест поиска максимальной стабильной clk_sys ===  
+          else if (command.equalsIgnoreCase("OCTEST")) {  
+            if (is_transmitting || tx_launching) {  
+              Serial.println(F("[OCTEST] Отказ: идёт передача. Завершите TX и повторите."));  
+            } else {  
+              Serial.println(F("[OCTEST] Запуск стресс-теста ядра. Зависание на сбойной"));  
+              Serial.println(F("[OCTEST] ступени нормально - watchdog перезагрузит плату,"));  
+              Serial.println(F("[OCTEST] результат последнего OK-шага сохранится в pll_overclock."));  
+              Serial.flush();                        // гарантировать вывод до смены clk_sys  
+            
+              vfo_find_max_stable_clock();
+            
+              Serial.println(F("[OCTEST] Завершён. Рекомендованный потолок:"));  
+              Serial.printf("[OCTEST] clk_sys=%u Hz, fbdiv=%u, p1=%u, p2=%u, VSEL=0x%02X\n",  
+                            (unsigned)pll_overclock.clk_sys_hz, pll_overclock.fbdiv,  
+                            pll_overclock.p1, pll_overclock.p2, pll_overclock.vsel);  
+              Serial.flush();  
+            }  
+            break;
+          }
+
+          // === PLLTEST: стресс-тест поиска максимальной стабильной PLL ===  
+          else if (command.equalsIgnoreCase("PLLTEST")) {  
+            if (is_transmitting || tx_launching) {  
+              Serial.println(F("[PLLTEST] Отказ: идёт передача. Завершите TX и повторите."));  
+            } else {  
+              Serial.println(F("[PLLTEST] Запуск стресс-теста ядра. Зависание на сбойной"));  
+              Serial.println(F("[PLLTEST] ступени нормально - watchdog перезагрузит плату,"));  
+              Serial.println(F("[PLLTEST] результат последнего OK-шага сохранится в pll_overclock."));  
+              Serial.flush();                        // гарантировать вывод до смены clk_sys  
+            
+              vfo_test_pll_extreme_shurm();
+            
+              Serial.println(F("[PLLTEST] Завершён. Рекомендованный потолок:"));  
+              Serial.printf("[PLLTEST] clk_sys=%u Hz, fbdiv=%u, p1=%u, p2=%u, VSEL=0x%02X\n",  
+                            (unsigned)pll_overclock.clk_sys_hz, pll_overclock.fbdiv,  
+                            pll_overclock.p1, pll_overclock.p2, pll_overclock.vsel);  
+              Serial.flush();  
+            }  
+            break;
+          }
+
+          // показать лимиты частоты
+          else if (command.equalsIgnoreCase("limits")) {
+            const char* src = (vfo_max_clk_sys_hz != PASSPORT_CLK_SYS_MAX_HZ ||  
+                               vfo_max_pll_vco_hz != PASSPORT_PLL_VCO_MAX_HZ)  
+                              ? "flash" : "passport";  
+            Serial.printf("[LIMITS] clk_sys<=%.3f МГц, PLL VCO<=%lu МГц "  
+                          "(source=%s, passport=133M/1600M)\n",  
+                          vfo_max_clk_sys_hz / 1e6,  
+                          (unsigned long)(vfo_max_pll_vco_hz / 1000000UL),  
+                          src); 
+          }
+
+          // тест JTTY-кодека
+          else if (command.equalsIgnoreCase("test jtty")) {
+            jtty_selftest();
+          }
+          else if (command.equalsIgnoreCase("test jtty pack")) { 
+            jtty_selftest_pack(); 
+          }
+
+          else if (command.equalsIgnoreCase("START JTTY")) {  
+            if (is_transmitting) {  
+              Serial.println(F("[Ошибка] Сейчас уже идет трансляция!"));  
+            } else {  
+              update_scheduler();  
+              uint32_t jtty_hz = strtoul(my_freq_jtty_var.c_str(), NULL, 10);  
+              if (jtty_hz == 0) jtty_hz = 14079000;  
+              char buf[148];  
+              snprintf(buf, sizeof(buf),  
+                      "[Система] %02d:%02d:%02d - Заявка принята. Выходим в эфир JTTY на частоте %s Гц...",  
+                      rtc_hour, rtc_min, rtc_sec, format_freq(jtty_hz).c_str());  
+              Serial.println(buf);  
+              force_jtty_transmission = true;  
+            }  
+          }
+
+          else if (command.length() > 5 &&  
+                   command.substring(0,5).equalsIgnoreCase("jtty ")) {
+              if (is_transmitting || rx_active) {  
+                  Serial.println(F("ОШИБКА: передатчик занят или идёт приём"));  
+              } else {  
+                  String txt = command.substring(5); txt.trim();  
+                  if (txt.length() == 0) {  
+                      Serial.println(F("ОШИБКА: jtty <текст до 80 симв.>"));  
+                  } else {  
+                      is_transmitting = true;  
+                      while (Serial.available() > 0) (void)Serial.read();   // снять хвост \r\n  
+                      uint32_t jtty_hz = scheduled_freq_hz ? scheduled_freq_hz : strtoul(my_freq_jtty_var.c_str(), nullptr, 10);  
+                      prepare_jtty_frequencies(jtty_hz);  
+                      jtty_send_string(txt.c_str());
+                      SI_POWER_OFF(); 
+                      dev_TX_state = false;
+                      is_transmitting = false;
+                  }  
+              }  
+          }
+
+          else if (command.startsWith("iq ")) {  
+              dbg_iq = command.indexOf("on") >= 0;  
+              Serial.printf("[IQ] stream %s\n", dbg_iq ? "ON" : "OFF");  
+          }
+
+          // .ino, рядом с обработчиком "adc"  
+          else if (command == "adcr") {  
+              bool was_running = false;               // если есть флаг rx_running — используй его  
+              rx_capture_stop();                      // остановить DMA/ADC free-run  
+            
+              adc_init();  
+              adc_gpio_init(RX_ADC_PIN_I);  
+              adc_gpio_init(RX_ADC_PIN_Q);  
+            
+              adc_select_input(0);                    // ADC0 = GP26  
+              uint16_t v0 = adc_read();  
+              adc_select_input(1);                    // ADC1 = GP27  
+              uint16_t v1 = adc_read();  
+            
+              Serial.printf("[ADCR] ADC0(GP26)=%u  ADC1(GP27)=%u\n", v0, v1);  
+              // RX перезапусти вручную командой rx jtty после теста  
+          }
+
+          // Прямое чтение каналов в обход захвата (только при выключенном RX!)  
+          else if (command == "adcq") {  
+              adc_init();  
+              adc_gpio_init(RX_ADC_PIN_I);  
+              adc_gpio_init(RX_ADC_PIN_Q);  
+              for (int ch = 0; ch < 2; ch++) {  
+                  adc_select_input(ch);  
+                  uint16_t mn = 0xFFFF, mx = 0;  
+                  for (int i = 0; i < 200; i++) {  
+                      uint16_t v = adc_read();  
+                      if (v < mn) mn = v; if (v > mx) mx = v;  
+                  }  
+                  Serial.printf("[ADCQ] ch%d (GP%d): %u..%u\n", ch, 26 + ch, mn, mx);  
+              }  
+          }
+
+          else if (command.startsWith("adc")) {  
+              const volatile uint32_t* blk = NULL;  
+              uint32_t t0 = millis();  
+              while (!blk && millis() - t0 < 100) blk = rx_capture_get_block();  
+            
+              if (!blk) {  
+                  Serial.println(F("[ADC] блоков нет — rx запущен?"));  
+              } else {  
+                  Serial.print(F("[ADC] raw:"));  
+                  for (int k = 0; k < 8; k++)  
+                      Serial.printf(" %08lX", (unsigned long)blk[k]);  
+                  Serial.println();  
+            
+                  int lo_i = 4095, hi_i = 0, lo_q = 4095, hi_q = 0;  
+                  int64_t si = 0, sq = 0;  
+                  const int npairs = RX_BLOCK_SAMPLES;  
+                  for (int k = 0; k < npairs; k++) {  
+                      int i = blk[k] & 0xFFFF;          // [15:0]  = I (ADC0)  
+                      int q = blk[k] >> 16;             // [31:16] = Q (ADC1)  
+                      if (i < lo_i) lo_i = i; if (i > hi_i) hi_i = i; si += i;  
+                      if (q < lo_q) lo_q = q; if (q > hi_q) hi_q = q; sq += q;  
+                  }  
+                  Serial.printf("[ADC] I: %d..%d mid=%ld  Q: %d..%d mid=%ld  drop=%lu\n",  
+                      lo_i, hi_i, (long)(si/npairs),  
+                      lo_q, hi_q, (long)(sq/npairs),  
+                      (unsigned long)rx_capture_dropped());  
+                  rx_capture_release();  
+              }  
+              Serial.printf("[ADC] fcs=0x%08lX cs=0x%08lX rrobin=0x%02lX\n",  
+                  (unsigned long)adc_hw->fcs,  
+                  (unsigned long)adc_hw->cs,  
+                  (unsigned long)((adc_hw->cs >> 16) & 0x1F));  
+          }
+
+          // Ручной прогон кодов: "bpf 0..15" — выставить код, "bpf" — показать текущий  
+          else if (command.startsWith("bpf")) {  
+              int sp = command.indexOf(' ');  
+              if (sp > 0) {  
+                  uint8_t c = (uint8_t)command.substring(sp+1).toInt();  
+                  for (int k = 0; k < 4; k++)  
+                      if (subband_pins[k] >= 0) digitalWrite(subband_pins[k], (c>>k)&1);  
+                  subband_current = c;  
+                  Serial.printf("[BPF] код=%u выставлен вручную\n", c);  
+              } else {  
+                  Serial.printf("[BPF] текущий код=%u\n", subband_current);  
+              }  
+          }
+
+          else if (command.startsWith("setparam ")) {
+            String param_part = command.substring(9);
+            param_part.trim();
+            int eq_idx = param_part.indexOf('=');
+            if (eq_idx != -1) {
+              String marker = param_part.substring(0, eq_idx);
+              String value  = param_part.substring(eq_idx + 1);
+              marker.trim();
+              value.trim();
+              if (marker.length() > 0 && value.length() > 0) {
+                update_info_config_from_console(marker, value);
+              }
+            } else {
+              Serial.println(F("[Ошибка] Неверный формат. Используйте: setparam МАРКЕР=ЗНАЧЕНИЕ"));
+            }
+          }
+          else {
+          Serial.println(F("=== СПРАВКА ПО КОМАНДАМ УПРАВЛЕНИЯ ==="));
+          Serial.println(F("help(или другое)- Вывести это справочное меню"));
+          Serial.println(F("?               - Показать текущую конфигурацию из INFO.txt, дату и время RTC"));
+          Serial.println(F("tele            - Вывести данные телеметрии"));
+          Serial.println(F("time            - Вывести текущее время и дату"));
+          Serial.println(F("time ЧЧ:ММ      - Установить время часов, например: time 12:45"));
+          Serial.println(F("time ЧЧ:ММ:CC   - Установить время часов, например: time 19:30:0)"));
+          Serial.println(F("date ДД.ММ.ГГГГ - Установить календарную дату, например: date 18.05.2026"));
+          Serial.println(F("text            - Показать текущий текст радиопередачи из конфигурации INFO.txt"));
+          Serial.println(F("text [текст]    - Записать новый текст передачи в файл конфигурации, например: text NEW TEXT"));
+          Serial.println(F("setparam M=V    - Изменить любой маркер в конфигурации, например: setparam CALL=RA3ABC или setparam QTH=NA56AV"));
+          Serial.println(F("sched           - Показать таблицу расписания передач из INFO.txt"));
+          Serial.println(F("start cw        - Немедленно запустить внеочередной сеанс CW"));
+          Serial.println(F("start rtty      - Немедленно запустить внеочередной сеанс RTTY"));
+          Serial.println(F("start ifkp      - Немедленно запустить внеочередной сеанс IFKP"));
+          Serial.println(F("start mfsk16    - Немедленно запустить внеочередной сеанс MFSK16"));
+          Serial.println(F("start dominoex  - Немедленно запустить внеочередной сеанс DominoEX 8"));
+          Serial.println(F("start fsq       - Немедленно запустить внеочередной сеанс FSQ"));
+          Serial.println(F("start jtty      - Немедленно запустить внеочередной сеанс JTTY"));
+          Serial.println(F("rx <mod> <f>    - Приём: rtty cw olivia contestia thor mfsk16 dominoex fsq ifkp"));  
+          Serial.println(F("rx off          - Остановить приёмник"));
+          Serial.println(F("clear log       - Стереть существующий файл LOG.TXT и создать новый пустой"));
+          Serial.println(F("clim            - Вывод таблицы климатических замеров"));
+          Serial.println(F("format disk     - Полностью стереть диск и записать дефолтные INFO.TXT, SET.TXT, LOG.TXT"));
+          Serial.println(F("remount         - Переподключить USB-диск (обновление в Проводнике)"));
+          Serial.println(F("modem           - Состояние эмулятора Hayes-модема (второй COM-порт, AT-команды)"));
+          Serial.println(F("stop            - Экстренная остановка передачи маяка"));
+          Serial.println(F("restart         - Мягкий виртуальный перезапуск маяка"));
+          Serial.println(F("reset           - Жесткий аппаратный сброс процессора RP2040"));
+          Serial.println(F("======================================="));
+          }
+        }
+      }
+    } 
+    else {
+      if (buf_idx < sizeof(cmd_buffer) - 1) {
+          cmd_buffer[buf_idx++] = c;
+      } else {
+          buf_idx = 0; // Защита от переполнения
+          reminder_shown = true;  
+          Serial.println(F("\n[Ошибка] Команда длиннее 63 символов — буфер очищен."));  
+      }
+    }
+  } // Конец while
+  
+  // Напоминание: буфер не пуст, а терминатор не приходит уже 10 секунд  
+  if (!reminder_shown && buf_idx > 0 && last_input_ms != 0 &&  
+      (millis() - last_input_ms > 10000)) {  
+    reminder_shown = true;  
+    Serial.println(F("\n[Подсказка] Команда набрана, но не отправлена. "  
+                     "Включите в терминале перевод строки (NL или NL&CR)."));  
+    Serial.print(F("> "));  
+    Serial.write(cmd_buffer, buf_idx);   // выводит ровно buf_idx байт, '\0' не нужен  
+    Serial.println();  
+  }  
+}
+
+
+
+
+void setup() {
+  adc_init();  
+
+  // --- USB: общие дескрипторы устройства ДО регистрации интерфейсов ---  
+  TinyUSBDevice.setManufacturerDescriptor("RU0AOG");  
+  TinyUSBDevice.setProductDescriptor("RP2040 Beacon");  
+  // Смена серийного номера заставляет Windows перечислить устройство как НОВОЕ  
+  // и завести свежие записи портов (без ручного удаления старых).  
+  TinyUSBDevice.setSerialDescriptor("RU0AOG-BEACON-0003");   // меняйте суффикс при каждой перепрошивке  
+  
+  init_usb_msc_interface();                       // Регистрирует дескрипторы Mass Storage...  
+  hayes_modem_init();                             // Второй виртуальный COM-порт...  
+  init_file_manager();  
+  init_flash_disk();
+
+
+  pinMode(PIN_USR_BUTTON, INPUT_PULLUP);          // инициализируем пин кнопки
+  delay(20);                                      // Даем Pull-up надежно поднять линию до +3.3 В
+  old_button_state = digitalRead(PIN_USR_BUTTON); // Фиксируем РЕАЛЬНОЕ стартовое состояние (HIGH)
+
+  wd_reboot_detected = watchdog_caused_reboot(); 
+
+  // запуск виртуального СОМ-порта через USB  
+  Serial.setStringDescriptor("Beacon Console");   // имя первого порта (должно стоять ДО begin)  
+  Serial.begin(115200);  
+
+  // Serial1.begin(115200, SERIAL_8N1); // Запуск аппаратного UART0 на пинах GP0 (TX) и GP1 (RX)
+  // Serial.println("[Система] Выходим в эфир...");  // это пойдет в USB
+  // Serial1.println("[Система] Выходим в эфир..."); // это пойдет по физическому проводу TX
+
+  // ожидание коннекта - до 5 сек
+  uint32_t timeout = millis();
+  while (!Serial && (millis() - timeout < 5000)) {
+      #if defined(ARDUINO_ARCH_RP2040) && !defined(ARDUINO_ARCH_MBED)
+      TinyUSBDevice.task();
+      #endif
+  }
+  float exactSeconds = (millis() - timeout) / 1000.0;
+  Serial.print("старт порта за ");
+  Serial.print(exactSeconds, 2); 
+  Serial.println(" сек");
+  //Serial.println("...");
+
+  Serial.println("[Система] Питание маяка включено.");
+  //Serial.println("[Система] Последовательное соединение восстановлено.");
+  pinMode(LED_BUILTIN, OUTPUT);
+  Serial.print("[Система] "); Serial.println(my_FAT);
+
+
+  I2C_Scanner();       // сканировать шину I2C, формировать таблицу устройств
+
+  init_BME();          // инициализировать bme280
+
+  init_scheduler();    // инициализировать дс3231
+
+  ensure_file_timestamps(); // проверка атрибутов даты/времени на файлах
+
+  init_si5351();       // инициализировать си5351
+
+  // Авто-BOOST: включаем разгон на каждую передачу, если flash-частоты выше стандартных  
+  vfo_auto_boost = vfo_flash_allows_boost();  
+  if (vfo_auto_boost) {  
+    Serial.printf("[BOOST  ] Авто-разгон ВКЛ: flash clk_sys<=%.1f МГц, VCO<=%.0f МГц (стандарт 133/1600)\n",  
+                  vfo_effective_clk_max() / 1e6, vfo_effective_pll_max() / 1e6);  
+  } else {  
+    Serial.println(F("[BOOST  ] Авто-разгон ВЫКЛ: flash-паспорт не выше стандартных 133 МГц."));  
+  }
+
+  ZERO_LED_init();     // инициализировать WS2812B
+
+  vfo_encoder_init();  // энкодер
+
+  vfo_subband_init();
+
+  // Инициализация пинов питания шин, если они назначены (не равны -1)
+  if (pin_pwr_si != -1) { pinMode(pin_pwr_si, OUTPUT); digitalWrite(pin_pwr_si, LOW); }
+  if (pin_pwr_ds != -1) { pinMode(pin_pwr_ds, OUTPUT); digitalWrite(pin_pwr_ds, HIGH); } // Часы обычно всегда запитаны
+  if (pin_pwr_bm != -1) { pinMode(pin_pwr_bm, OUTPUT); digitalWrite(pin_pwr_bm, LOW); }
+  if (pin_pwr_dl != -1) { pinMode(pin_pwr_dl, OUTPUT); digitalWrite(pin_pwr_dl, LOW); }
+  // ПРАВКА: Инициализация динамического пина активации УМ из файла SET.TXT
+  if (pin_amp_act != -1) {
+    pinMode(pin_amp_act, OUTPUT);
+    digitalWrite(pin_amp_act, dev_TX_state);
+  }
+
+  watchdog_enable(8000, true);   // 8 сек; true = не тикать при остановке по отладчику
+
+  if (debug_flag) {
+    // вывод сообщения
+    Serial.println(F("[Система] Запуск сторожевого таймера - ок"));
+  }
+  
+  Serial.println(F(""));
+  print_schedule();
+  Serial.println(F(""));
+  //Serial.println(F("\n================================================================"));
+  Serial.println(F("  АВТОМАТИЧЕСКИЙ РАДИОМАЯК ЗАПУЩЕН"));
+  Serial.print(F("  версия "));
+  Serial.print(BCN_VER);
+  Serial.print(F(" прошивка от "));
+  Serial.println(BCN_DAT);
+  Serial.println(F("  Плата готова к работе."));
+  Serial.print(F("  Текущая дата ")); Serial.print(get_current_date()); Serial.print(F(" время ")); Serial.println(get_current_time());
+  Serial.println(F("  Введите команду или h для выхода в справочное меню."));
+  Serial.println(F("=========================================================================="));
+  system_ready = true;
+}
+
+
+
+void loop() {
+
+  #if defined(ARDUINO_ARCH_RP2040) && !defined(ARDUINO_ARCH_MBED)
+  TinyUSBDevice.task(); 
+  #endif
+  
+  watchdog_update();  // сброс сторожевого таймера
+
+  // Вычитываем очередь DSP. Блок принадлежит потребителю до release_output().
+  // В каждый момент времени у очереди только один потребитель:
+  // декодер ИЛИ спектроанализатор.
+  if (rx_active) {
+    const int16_t* bi = nullptr;
+    const int16_t* bq = nullptr;
+    uint8_t bn = 0;
+
+    while (rx_dsp_get_output(&bi, &bq, &bn)) {
+      if (rx_mode == 0xFF) {
+        rx_spectrum_process(bi, bq, bn);
+      } else {
+        rx_decoders_process(bi, bq, bn);
+      }
+      rx_dsp_release_output();
+    }
+
+    if (rx_mode == 0xFF) {
+      rx_spectrum_poll();
+    }
+  }
+
+  vfo_encoder_poll(); // энкодер
+  // перестройка делается в poll(), не в прерывании: boost-цикл переконфигурирует PLL и перезапускает Core 1, из ISR это запрещено.
+  
+  // Сброс предпускового флага в начале цикла
+  tx_launching = false;
+
+  extern uint8_t rtc_sec; 
+  // =========================================================================
+  // 1. ОБРАБОТКА МЯГКОГО РЕСТАРТА
+  // =========================================================================
+  if (soft_restart_flag) {
+    soft_restart_flag = false; 
+    current_tone = 0;
+    usr_chain_state = USR_IDLE;
+    delay(100);
+    read_and_parse_INFO_txt(); // Извлекаем чистые маркеры
+    pc_file_written = false;
+    Serial.println("Рестарт: OK");
+    //print_current_settings();
+    return; // Сразу уходим на новый виток loop, сбрасывая старые флаги
+  }
+
+
+
+  // =========================================================================
+  // СИСТЕМНЫЙ АВТОМАТ ПОСЛЕДОВАТЕЛЬНОЙ ПЕРЕДАЧИ ПО КНОПКЕ USR (С БЛОКИРОВКОЙ)
+  // =========================================================================
+  bool current_button_state = digitalRead(PIN_USR_BUTTON);
+  
+   /*
+  // Отслеживаем клик (переход из HIGH в LOW). 
+  // Запуск возможен только из режима ожидания (USR_IDLE) и если станция абсолютно свободна (!is_transmitting)
+    if (current_button_state == LOW && old_button_state == HIGH && usr_chain_state == USR_IDLE) {  
+        // тестовый запуск: только CW (цепочку CW/IFKP вернём после отладки приёма)  
+        usr_chain_state = USR_START_IFKP;  
+    }  
+  old_button_state = current_button_state;
+   */
+
+  // /*
+  if (current_button_state == LOW && old_button_state == HIGH && usr_chain_state == USR_IDLE) {    
+        // запуск передачи JTTY по кнопке
+        if (is_transmitting) {    
+          Serial.println(F("[Ошибка] Сейчас уже идет трансляция!"));    
+        } else {    
+          update_scheduler();    
+          uint32_t thor_hz = strtoul(my_freq_fsq_var.c_str(), NULL, 10);    
+          if (thor_hz == 0) thor_hz = 3602500;    
+          char buf[148];    
+          snprintf(buf, sizeof(buf),    
+                  "[Система] %02d:%02d:%02d - Нажата кнопка USR. Выходим в эфир AX25 на частоте %s Гц...",    
+                  rtc_hour, rtc_min, rtc_sec, format_freq(thor_hz).c_str());    
+          Serial.println(buf);    
+          force_ax25_transmission = true;    
+        }    
+    }    
+  old_button_state = current_button_state;
+  // */
+
+
+
+
+  // Отработка шагов автомата
+  switch (usr_chain_state) {
+    case USR_START_CW:
+      // Передаем управление модулю CW. Флаг is_transmitting уже равен true, планировщик заблокирован
+      Serial.println(F("[Автомат] Шаг 1: Запуск внеочередной передачи CW."));
+      force_cw_transmission = true; 
+      usr_chain_state = USR_WAIT_FOR_RTTY;
+      break;
+
+    case USR_WAIT_FOR_RTTY:  
+      // Тестовый режим: кнопка USR запускает ТОЛЬКО CW, цепочка RTTY/IFKP отключена.  
+      if (!force_cw_transmission && !is_transmitting) {  
+        Serial.println(F("[Автомат] Передача CW завершена. Тестовый режим: цепочка остановлена."));  
+        LCD_init(true);  
+        LCD_print("CW DONE! READY", 0, 0);  
+        usr_chain_state = USR_IDLE;        // автомат в исходное, блокировка честно снята (is_transmitting уже false)  
+      }  
+      break;
+
+    case USR_START_RTTY:
+      // Удерживаем блокировку, пока тикают 15 секунд
+      if (millis() - usr_timer_ms >= 15000) {
+        if (pc_file_written || soft_restart_flag) { is_transmitting = false; usr_chain_state = USR_IDLE; break; }
+        Serial.println(F("[Автомат] Шаг 2: Время вышло. Запуск передачи RTTY."));
+        force_rtty_transmission = true; 
+        usr_chain_state = USR_WAIT_FOR_IFKP;
+        usr_chain_state = USR_CLOSE_CHAIN;   // после RTTY сразу освобождаем шину
+      } else {
+        is_transmitting = true;   // Защитное удержание флага занятости во время тиканья таймера
+      }
+      break;
+
+    case USR_WAIT_FOR_IFKP:
+      // Ждем окончания сеанса RTTY (когда модулятор RTTY сбросит свой force-флаг)
+      if (!force_rtty_transmission && !is_transmitting) {
+        Serial.println(F("[Автомат] Передача RTTY завершена. Блокировка удержана. Пауза 15 сек перед IFKP..."));
+        is_transmitting = true;   // Снова принудительно держим флаг занятости передатчика
+        usr_timer_ms = millis();  // Засекаем вторые 15 секунд тишины
+        usr_chain_state = USR_START_IFKP;
+      }
+      break;
+
+    case USR_START_IFKP:
+      // Удерживаем блокировку во время второй паузы
+      if (millis() - usr_timer_ms >= 15000) {
+        if (pc_file_written || soft_restart_flag) { is_transmitting = false; usr_chain_state = USR_IDLE; break; }
+        Serial.println(F("[Автомат] Шаг 3: Время вышло. Запуск передачи IFKP."));
+        force_ifkp_transmission = true; 
+        usr_chain_state = USR_CLOSE_CHAIN; // Переходим к финальной стадии освобождения шины
+      } else {
+        is_transmitting = true;
+      }
+      break;
+
+    case USR_CLOSE_CHAIN:
+      // Финальный шаг: ждем, пока отработает IFKP модулятор
+      if (!force_ifkp_transmission && !is_transmitting) {
+        Serial.println(F("[Автомат] Передача IFKP завершена. Вся цепочка выполнена успешно. Снимаем блокировку."));
+        LCD_init(true);
+        LCD_print("CHAIN DONE! READY", 0, 0);
+        usr_chain_state = USR_IDLE; // Полное обнуление автомата, is_transmitting теперь честно равен false
+      }
+      break;
+
+    case USR_IDLE:
+    default:
+      break;
+  }
+
+  // Аварийный останов всей ручной цепочки и сброс блокировок, если ПК подключился к диску
+  if (pc_file_written) {
+    is_transmitting = false;
+    usr_chain_state = USR_IDLE;
+  }
+
+
+  // =========================================================================
+  // 2. СИСТЕМНЫЙ ТАКТ И ПЛАНИРОВЩИК (250 мс)
+  // =========================================================================
+  static uint32_t last_rtc_tick = 0;
+  if (millis() - last_rtc_tick >= 250) {
+    last_rtc_tick = millis();
+    update_scheduler();
+  }
+
+  // =========================================================================
+  // 3. ПЕРИОДИЧЕСКИЙ ВЫВОД ИНФОРМАЦИИ (Каждые 5 секунд)
+  // =========================================================================
+  static uint8_t last_printed_sec = 255; // Статическая переменная для хранения секунды
+
+  // Проверяем, кратна ли текущая секунда 5
+  if (rtc_sec % 5 == 0 && rtc_sec != last_printed_sec) {
+    // Проверяем условия: отсутствие эфира и активности
+    if (!pc_activity_detected && !soft_restart_flag && !is_transmitting && !rx_active) {
+      last_printed_sec = rtc_sec; // Запоминаем секунду, блокируя повторные вызовы внутри нее
+      
+      update_scheduler();
+      //char buf[34];
+      //snprintf(buf, sizeof(buf), "[Таймер] %02d:%02d:%02d", rtc_hour, rtc_min, rtc_sec);
+      //Serial.print(buf);
+      //Serial.print(F(" ")); Serial.print(get_telemetry_string());
+      //Serial.print(F(" ")); Serial.println(get_climate_telemetry());
+      ZERO_LED_GREEN_ON();
+      delay(5);
+      ZERO_LED_OFF();
+
+      LCD_init(true);   
+        // --- ИСПРАВЛЕННЫЙ БЛОК ВЫРАВНИВАНИЯ ДЛЯ LCD1602 ---
+        // 1. Извлекаем чистые числовые значения, полностью отвязавшись от индексов snprintf
+        String climate_str = get_climate_telemetry(); // Например: "T_CL=27.5C P_CL=749.4mm H_CL=45.2%"
+        
+        int p_idx = climate_str.indexOf("P_CL=");
+        // int h_idx = climate_str.indexOf("H_CL=");
+        
+        String P_value = "000.0"; // Дефолт, если барометр отключен
+        if (p_idx != -1) {
+          // Выкусываем чистое число давления между "P_CL=" и "mm"
+          int p_end = climate_str.indexOf("mm", p_idx);
+          if (p_end != -1) {
+            P_value = climate_str.substring(p_idx + 5, p_end);
+            P_value.trim();
+          }
+        }
+
+        // 2. Формируем строгие 16-символьные строки для экранов 1602
+        // Верхняя строка (Строка 0): "CPU 36.1   21:09" -> ровно 16 символов
+        char lcd_line0[17];
+        String current_time_str = get_current_time().substring(0, 5); // "ЧЧ:ММ"
+        String raw_cpu_temp = get_telemetry_string().substring(get_telemetry_string().indexOf("T_CPU=") + 6, get_telemetry_string().indexOf("T_CPU=") + 10);
+        snprintf(lcd_line0, sizeof(lcd_line0), "CPU %-4s   %5s", raw_cpu_temp.c_str(), current_time_str.c_str());
+
+        // Нижняя строка (Строка 1): "TMP 27.5  749.4m" -> ровно 16 символов
+        char lcd_line1[17];
+        String raw_cl_temp = climate_str.substring(5, 9); // "27.5"
+        snprintf(lcd_line1, sizeof(lcd_line1), "TMP %-4s %5smm", raw_cl_temp.c_str(), P_value.c_str());
+
+        // 3. Выводим готовые монолитные строки, исключая артефакты от старого текста
+        LCD_print(lcd_line0, 0, 0);
+        LCD_print(lcd_line1, 1, 0);
+        // --------------------------------------------------
+
+    }
+  }
+
+  
+
+  // =========================================================================
+  // 4. ОПРОС ИНТЕРФЕЙСОВ И КОМАНД
+  // =========================================================================
+  check_and_handle_pc_changes();
+  check_serial_commands();
+  hayes_modem_poll();       // эмулятор Hayes-модема на втором COM-порту
+
+  // Если за время проверки команд взлетел флаг рестарта — выходим
+  if (soft_restart_flag || pc_file_written) return;
+
+
+  // =========================================================================
+  // РЕЖИМ 0. СЕАНС СВЯЗИ CW
+  // =========================================================================
+  if (( (is_time_to_transmit(MODE_CW) && !is_transmitting) || force_cw_transmission) && !pc_file_written && !soft_restart_flag) {
+    force_cw_transmission = false;
+    is_transmitting = true;
+    tx_launching = false; // Сбрасываем защитный флаг сразу после фиксации is_transmitting
+    
+    if (debug_flag) {  
+      char time_buf[128];
+      snprintf(time_buf, sizeof(time_buf), "[Система] %02d:%02d:%02d - Наступило время сеанса CW! Выходим в эфир...", rtc_hour, rtc_min, rtc_sec);
+      Serial.println(time_buf);
+    }
+    
+    if ((my_call_variable.length() > 0 || my_text_variable.length() > 0) && !soft_restart_flag) {
+      
+      // Засекаем точное время старта сеанса в эфире
+      uint32_t cw_session_start_ms = millis();
+      dev_TX_state = true;
+      update_scheduler();
+      SI_POWER_ON();
+      
+      if (!pc_file_written && !soft_restart_flag) {
+        uint32_t cw_hz = (scheduled_freq_hz > 0) ? scheduled_freq_hz  
+                 : ((my_freq_cw_var.length() > 0) ? strtoul(my_freq_cw_var.c_str(), NULL, 10) : 3601000);    // приоритет отдать частоте задачи по расписанию
+        
+        prepare_cw_frequency(cw_hz);
+        if (debug_flag) {
+          Serial.print(F("[Скорость] ")); Serial.print(1200 / CW_DOT_TIME_MS); Serial.print(F(" WPM, "));
+          Serial.print(F("длительность точки ")); Serial.print(CW_DOT_TIME_MS); Serial.println(F(" мс"));
+        }
+        
+        // ШАГ 1: Передача позывного и локатора
+        if (!pc_file_written && !soft_restart_flag) {
+          Serial.print(F("[ЭФИР_CW] Вызов: "));
+          send_cw_string("VVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " ");
+        }
+        
+        // ШАГ 2: Передача основного текста
+        if (!pc_file_written && !soft_restart_flag) {
+          Serial.print(F("[ЭФИР_CW] Текст: "));
+          send_cw_string(my_text_variable + " ");
+        }
+        
+        // ШАГ 3: Передача первой телеметрии
+        if (!pc_file_written && !soft_restart_flag) {
+          String telemetry = get_telemetry_string();
+          Serial.print(F("[ЭФИР_CW] Телем: "));
+          send_cw_string(telemetry);
+        }
+        
+        // ШАГ 4: Передача климатической телеметрии
+        if (!pc_file_written && !soft_restart_flag) {
+          if (device_BM[0] == 1) {
+            String telemetry = get_climate_telemetry();
+            Serial.print(F("[ЭФИР_CW] Телем: "));
+            send_cw_string(telemetry);
+          }
+          else {
+            Serial.println(F("[Система] отсутствует климатический модуль. Погодная телеметрия не передаётся"));
+          }
+        }
+        
+        // ШАГ 5: Завершение передачи
+        if (!pc_file_written && !soft_restart_flag) {
+          Serial.print(F("[ЭФИР_CW] Конец: "));
+          send_cw_string("OVER.");
+        }
+        
+        // Считаем, сколько полных секунд длился сеанс
+        uint32_t cw_session_duration_sec = (millis() - cw_session_start_ms) / 1000;
+        update_scheduler();
+        char end_buf[128];
+        snprintf(end_buf, sizeof(end_buf), "[Система] %02d:%02d:%02d - Сеанс CW завершен. Длительность: %lu сек.", rtc_hour, rtc_min, rtc_sec, cw_session_duration_sec);
+        Serial.println(end_buf);
+
+        if (debug_flag) {
+          // Пишем в файл на виртуальную флешку историю работы
+          log_file_write_line("Сеанс CW завершен.   Длительность: " + String(cw_session_duration_sec) + " сек.");
+        }
+      } 
+      
+      // БЛОК ВЫХОДА ИЗ СЕАНСА - выполняется всегда: и при успехе, и при экстренном прерывании
+      is_transmitting = false;
+      scheduled_freq_hz = 0;  // обнулить частоту, чтобы не выдать частоту расписания по прямой команде пользователя
+      SI_POWER_OFF();
+      dev_TX_state = false;
+      update_scheduler(); // Переключаем планировщик на следующий интервал времени
+    } 
+  }
+
+  // =========================================================================
+  // РЕЖИМ 1. СЕАНС СВЯЗИ RTTY
+  // =========================================================================
+  if (( (is_time_to_transmit(MODE_RTTY) && !is_transmitting) || force_rtty_transmission) && !pc_file_written && !soft_restart_flag) {
+    force_rtty_transmission = false;
+    is_transmitting = true;
+    tx_launching = false; // Сбрасываем защитный флаг сразу после фиксации is_transmitting
+    
+    if (debug_flag) {
+      char time_buf[128];
+      snprintf(time_buf, sizeof(time_buf), "[Система] %02d:%02d:%02d - Наступило время сеанса RTTY! Выходим в эфир...", rtc_hour, rtc_min, rtc_sec);
+      Serial.println(time_buf);
+    }
+    
+    if ((my_call_variable.length() > 0 || my_text_variable.length() > 0) && !soft_restart_flag) {
+      
+      // Засекаем точное время старта сеанса
+      uint32_t rtty_session_start_ms = millis();
+      dev_TX_state = true;
+      update_scheduler();
+      SI_POWER_ON();
+      
+      if (!pc_file_written && !soft_restart_flag) {
+        // --- НОВАЯ КОРРЕКТИРОВКА РАСЧЕТА ЧАСТОТ RTTY ---
+        uint32_t rtty_mark_hz = (scheduled_freq_hz > 0) ? scheduled_freq_hz    // приоритет отдать частоте задачи по расписанию
+                        : strtoul(my_rtty_mark_var.c_str(), NULL, 10);
+        if (rtty_mark_hz == 0)  rtty_mark_hz = 3601585; // Дефолтная частота MARK
+
+        uint32_t rtty_shift_hz = strtoul(my_rtty_shift_var.c_str(), NULL, 10);
+        if (rtty_shift_hz == 0) rtty_shift_hz = 170;    // Дефолтный сдвиг 170 Гц
+
+        bool rtty_invert = (my_rtty_invert_var == "1"); // Флаг инверсии
+        
+        // Вызов обновленной функции модема
+        prepare_rtty_frequencies(rtty_mark_hz, rtty_shift_hz, rtty_invert);
+        
+        Serial.print(F("[Скорость]: ")); Serial.print(1000000.0f / RTTY_BIT_TIME_US, 2); Serial.println(F(" бод"));  
+        Serial.print(F("  длительность бита: ")); Serial.print(RTTY_BIT_TIME_US / 1000); Serial.println(F(" мс"));  
+        Serial.print(F("  частота: ")); Serial.print(rtty_mark_hz); Serial.println(F(" Гц"));  
+        Serial.print(F("  разнос: ")); Serial.print(rtty_shift_hz); Serial.println(F(" Гц"));  
+        Serial.print(F("  инверсия: ")); Serial.println(rtty_invert ? F("да") : F("нет"));  
+          
+        // ШАГ 1: RTTY передача позывного и локатора
+        if (!pc_file_written && !soft_restart_flag) {
+          Serial.print(F("[ЭФИР_RTTY] Вызов: "));
+          send_rtty_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n");
+        }
+        
+        // ШАГ 2: RTTY передача основного текста
+        if (!pc_file_written && !soft_restart_flag) {
+          Serial.print(F("[ЭФИР_RTTY] Текст: "));
+          send_rtty_string(my_text_variable + " ");
+        }
+        
+        // ШАГ 3: RTTY передача первой телеметрии
+        if (!pc_file_written && !soft_restart_flag) {
+          String telemetry = get_telemetry_string();
+          Serial.print(F("[ЭФИР_RTTY] Телем: "));
+          send_rtty_string(telemetry);
+        }
+
+        // ШАГ 4: Передача климатической телеметрии
+        if (!pc_file_written && !soft_restart_flag) {
+          if (device_BM[0] == 1) {
+            String telemetry = get_climate_telemetry();
+          Serial.print(F("[ЭФИР_RTTY] Телем: "));
+            send_rtty_string(telemetry);
+          }
+          else {
+            Serial.println(F("[Система] отсутствует климатический модуль. Погодная телеметрия не передаётся"));
+          }
+        }
+        
+        // ШАГ 5: RTTY завершение передачи
+        if (!pc_file_written && !soft_restart_flag) {
+          Serial.print(F("[ЭФИР_RTTY] Конец: "));
+          send_rtty_string("OVER.\r\n\r\n");
+        }
+        
+        // Строка лога выводится СТРОГО при штатном завершении сеанса
+        if (!pc_file_written && !soft_restart_flag) {
+          uint32_t rtty_session_duration_sec = (millis() - rtty_session_start_ms) / 1000;
+          update_scheduler();
+          char end_buf[128];
+          snprintf(end_buf, sizeof(end_buf), "[Система] %02d:%02d:%02d - Сеанс RTTY завершен. Длительность: %lu сек.", rtc_hour, rtc_min, rtc_sec, rtty_session_duration_sec);
+          Serial.println(end_buf);
+        if (debug_flag) {
+          // Пишем в файл на виртуальную флешку историю работы
+          log_file_write_line("Сеанс RTTY завершен. Длительность: " + String(rtty_session_duration_sec) + " сек.");
+          }
+        }
+      } 
+      
+      // ГАРАНТИРОВАННЫЙ БЛОК ВЫХОДА ИЗ СЕАНСА
+      is_transmitting = false;
+      scheduled_freq_hz = 0;  // обнулить частоту, чтобы не выдать частоту расписания по прямой команде пользователя
+      SI_POWER_OFF();
+      dev_TX_state = false;
+      update_scheduler(); 
+    } 
+  }
+
+
+  // =========================================================================
+  // РЕЖИМ 2. СЕАНС СВЯЗИ IFKP
+  // =========================================================================
+  if (( (is_time_to_transmit(MODE_IFKP) && !is_transmitting) || force_ifkp_transmission) && !pc_file_written && !soft_restart_flag) {
+    force_ifkp_transmission = false;
+    is_transmitting = true;
+    tx_launching = false; // Сбрасываем защитный флаг сразу после фиксации is_transmitting
+    
+    if (debug_flag) {
+      char time_buf[128];
+      snprintf(time_buf, sizeof(time_buf), "[Система] %02d:%02d:%02d - Наступило время сеанса IFKP! Выходим в эфир...", rtc_hour, rtc_min, rtc_sec);
+      Serial.println(time_buf);
+    }
+    
+    if ((my_call_variable.length() > 0 || my_text_variable.length() > 0) && !soft_restart_flag) {
+      
+      // Засекаем точное время старта сеанса связи IFKP
+      uint32_t ifkp_session_start_ms = millis();
+      dev_TX_state = true;
+      update_scheduler();
+      SI_POWER_ON();
+      
+      if (!pc_file_written && !soft_restart_flag) {
+        uint32_t ifkp_hz = (scheduled_freq_hz > 0) ? scheduled_freq_hz  // приоритет отдать частоте задачи по расписанию
+                   : strtoul(my_freq_ifkp_var.c_str(), NULL, 10);
+        if (ifkp_hz == 0) ifkp_hz = 3601307; 
+        
+        // Вывод параметров IFKP
+        prepare_ifkp_frequencies(ifkp_hz);
+        
+        // IFKP: передача стартовой калибровочной лесенки (33 тона)
+        if (!pc_file_written && !soft_restart_flag) {
+          Serial.print(F("[ЭФИР_IFKP] Калибровочная лесенка "));
+          // Вызываем готовую безопасную функцию из модема
+          // send_ifkp_calibration_ladder(); 
+          Serial.println(F("ОК"));
+        }
+        
+        // IFKP: передача позывного и локатора
+        if (!pc_file_written && !soft_restart_flag) {
+          Serial.print(F("[ЭФИР_IFKP] Вызов: "));
+          send_ifkp_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n"); 
+        }
+        
+        // IFKP: передача стартовой калибровочной лесенки (33 тона)
+        if (!pc_file_written && !soft_restart_flag) {
+          Serial.print(F("[ЭФИР_IFKP] Калибровочная лесенка "));
+          // Вызываем готовую безопасную функцию из модема
+          // send_ifkp_calibration_ladder(); 
+          Serial.println(F("ОК"));
+        }
+        
+        // IFKP: передача основного текста
+        if (!pc_file_written && !soft_restart_flag) {
+          Serial.print(F("[ЭФИР_IFKP] Текст: "));
+          send_ifkp_string(my_text_variable + "\r\n"); 
+        }
+        
+        // IFKP: передача первой телеметрии
+        if (!pc_file_written && !soft_restart_flag) {
+          String telemetry = get_telemetry_string();
+          Serial.print(F("[ЭФИР_IFKP] Телем: "));
+          send_ifkp_string(telemetry);
+        }
+
+        // ШАГ 4: Передача климатической телеметрии
+        if (!pc_file_written && !soft_restart_flag) {
+          if (device_BM[0] == 1) {
+            String telemetry = get_climate_telemetry();
+          Serial.print(F("[ЭФИР_IFKP] Телем: "));
+            send_ifkp_string(telemetry);
+          }
+          else {
+            Serial.println(F("[Система] отсутствует климатический модуль. Погодная телеметрия не передаётся"));
+          }
+        }
+        
+        // IFKP завершение передачи
+        if (!pc_file_written && !soft_restart_flag) {
+          Serial.print(F("[ЭФИР_IFKP] Конец: "));
+          send_ifkp_string("OVER.\r\n\r\n");
+        }
+        
+        // Выводим информацию о длительности ТОЛЬКО при успешном и полном цикле сеанса
+        if (!pc_file_written && !soft_restart_flag) {
+          uint32_t ifkp_session_duration_sec = (millis() - ifkp_session_start_ms) / 1000;
+          update_scheduler();
+          char end_buf[128];
+          snprintf(end_buf, sizeof(end_buf), "[Система] %02d:%02d:%02d - Сеанс IFKP завершен. Длительность: %lu сек.", rtc_hour, rtc_min, rtc_sec, ifkp_session_duration_sec);
+          Serial.println(end_buf);
+          if (debug_flag) {
+            // Пишем в файл на виртуальную флешку историю работы
+            log_file_write_line("Сеанс IFKP завершен. Длительность: " + String(ifkp_session_duration_sec) + " сек.");
+          }
+        }
+      } 
+      
+      // ГАРАНТИРОВАННЫЙ БЛОК ВЫХОДА ИЗ СЕАНСА
+      is_transmitting = false;
+      scheduled_freq_hz = 0;  // обнулить частоту, чтобы не выдать частоту расписания по прямой команде пользователя
+      SI_POWER_OFF();
+      dev_TX_state = false;
+      update_scheduler(); // Гарантированно сдвигаем планировщик во избежание бесконечного перезапуска цикла
+    } 
+  }
+
+
+// =========================================================================  
+  // РЕЖИМ 3. СЕАНС СВЯЗИ OLIVIA 8/250  
+  // =========================================================================  
+  if (( (is_time_to_transmit(MODE_OLIVIA) && !is_transmitting) || force_olivia_transmission) && !pc_file_written && !soft_restart_flag) {  
+    force_olivia_transmission = false;  
+    is_transmitting = true;  
+    tx_launching = false; // Сбрасываем защитный флаг сразу после фиксации is_transmitting  
+  
+    if (debug_flag) {  
+      char time_buf[128];  
+      snprintf(time_buf, sizeof(time_buf), "[Система] %02d:%02d:%02d - Наступило время сеанса OLIVIA! Выходим в эфир...", rtc_hour, rtc_min, rtc_sec);  
+      Serial.println(time_buf);  
+    }  
+  
+    if ((my_call_variable.length() > 0 || my_text_variable.length() > 0) && !soft_restart_flag) {  
+  
+      uint32_t olivia_session_start_ms = millis();  
+      dev_TX_state = true;  
+      update_scheduler();  
+      SI_POWER_ON();  
+  
+      if (!pc_file_written && !soft_restart_flag) {  
+        uint32_t olivia_hz = (scheduled_freq_hz > 0) ? scheduled_freq_hz           // приоритет частоте из расписания  
+                   : strtoul(my_freq_olivia_var.c_str(), NULL, 10);  
+        if (olivia_hz == 0) olivia_hz = 3601307;  
+  
+        prepare_olivia_frequencies(olivia_hz);  
+  
+        // OLIVIA: позывной и локатор  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_OLIVIA] Вызов: "));  
+          olivia_send_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n");  
+        }  
+  
+        // OLIVIA: основной текст  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_OLIVIA] Текст: "));  
+          olivia_send_string(my_text_variable + "\r\n");  
+        }  
+  
+        // OLIVIA: первая телеметрия  
+        if (!pc_file_written && !soft_restart_flag) {  
+          String telemetry = get_telemetry_string();  
+          Serial.print(F("[ЭФИР_OLIVIA] Телем: "));  
+          olivia_send_string(telemetry);  
+        }  
+  
+        // OLIVIA: климатическая телеметрия  
+        if (!pc_file_written && !soft_restart_flag) {  
+          if (device_BM[0] == 1) {  
+            String telemetry = get_climate_telemetry();  
+            Serial.print(F("[ЭФИР_OLIVIA] Телем: "));  
+            olivia_send_string(telemetry);  
+          } else {  
+            Serial.println(F("[Система] отсутствует климатический модуль. Погодная телеметрия не передаётся"));  
+          }  
+        }  
+  
+        // OLIVIA: завершение  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_OLIVIA] Конец: "));  
+          olivia_send_string("OVER.\r\n\r\n");  
+        }  
+  
+        if (!pc_file_written && !soft_restart_flag) {  
+          uint32_t olivia_session_duration_sec = (millis() - olivia_session_start_ms) / 1000;  
+          update_scheduler();  
+          char end_buf[128];  
+          snprintf(end_buf, sizeof(end_buf), "[Система] %02d:%02d:%02d - Сеанс OLIVIA завершен. Длительность: %lu сек.", rtc_hour, rtc_min, rtc_sec, olivia_session_duration_sec);  
+          Serial.println(end_buf);  
+          if (debug_flag) {  
+            log_file_write_line("Сеанс OLIVIA завершен. Длительность: " + String(olivia_session_duration_sec) + " сек.");  
+          }  
+        }  
+      }  
+  
+      // ГАРАНТИРОВАННЫЙ БЛОК ВЫХОДА ИЗ СЕАНСА  
+      is_transmitting = false;  
+      scheduled_freq_hz = 0;  
+      SI_POWER_OFF();  
+      dev_TX_state = false;  
+      update_scheduler();  
+    }  
+  }
+
+
+// =========================================================================    
+  // РЕЖИМ. СЕАНС СВЯЗИ CONTESTIA 8/250    
+  // =========================================================================    
+  if (( (is_time_to_transmit(MODE_CONTESTIA) && !is_transmitting) || force_contestia_transmission) && !pc_file_written && !soft_restart_flag) {    
+    force_contestia_transmission = false;    
+    is_transmitting = true;    
+    tx_launching = false;    
+    
+    if (debug_flag) {    
+      char time_buf[128];    
+      snprintf(time_buf, sizeof(time_buf), "[Система] %02d:%02d:%02d - Наступило время сеанса CONTESTIA! Выходим в эфир...", rtc_hour, rtc_min, rtc_sec);    
+      Serial.println(time_buf);    
+    }    
+    
+    if ((my_call_variable.length() > 0 || my_text_variable.length() > 0) && !soft_restart_flag) {    
+    
+      uint32_t contestia_session_start_ms = millis();    
+      dev_TX_state = true;    
+      update_scheduler();    
+      SI_POWER_ON();    
+    
+      if (!pc_file_written && !soft_restart_flag) {    
+        uint32_t contestia_hz = (scheduled_freq_hz > 0) ? scheduled_freq_hz    
+                   : strtoul(my_freq_contestia_var.c_str(), NULL, 10);    
+        if (contestia_hz == 0) contestia_hz = 3601307;    
+    
+        prepare_contestia_frequencies(contestia_hz);    
+    
+        if (!pc_file_written && !soft_restart_flag) {    
+          Serial.print(F("[ЭФИР_CONTESTIA] Вызов: "));    
+          contestia_send_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n");    
+        }    
+    
+        if (!pc_file_written && !soft_restart_flag) {    
+          Serial.print(F("[ЭФИР_CONTESTIA] Текст: "));    
+          contestia_send_string(my_text_variable + "\r\n");    
+        }    
+    
+        if (!pc_file_written && !soft_restart_flag) {    
+          String telemetry = get_telemetry_string();    
+          Serial.print(F("[ЭФИР_CONTESTIA] Телем: "));    
+          contestia_send_string(telemetry);    
+        }    
+    
+        if (!pc_file_written && !soft_restart_flag) {    
+          if (device_BM[0] == 1) {    
+            String telemetry = get_climate_telemetry();    
+            Serial.print(F("[ЭФИР_CONTESTIA] Телем: "));    
+            contestia_send_string(telemetry);    
+          } else {    
+            Serial.println(F("[Система] отсутствует климатический модуль. Погодная телеметрия не передаётся"));    
+          }    
+        }    
+    
+        if (!pc_file_written && !soft_restart_flag) {    
+          Serial.print(F("[ЭФИР_CONTESTIA] Конец: "));    
+          contestia_send_string("OVER.\r\n\r\n");    
+        }    
+    
+        if (!pc_file_written && !soft_restart_flag) {    
+          uint32_t contestia_session_duration_sec = (millis() - contestia_session_start_ms) / 1000;    
+          update_scheduler();    
+          char end_buf[128];    
+          snprintf(end_buf, sizeof(end_buf), "[Система] %02d:%02d:%02d - Сеанс CONTESTIA завершен. Длительность: %lu сек.", rtc_hour, rtc_min, rtc_sec, contestia_session_duration_sec);    
+          Serial.println(end_buf);    
+          if (debug_flag) {    
+            log_file_write_line("Сеанс CONTESTIA завершен. Длительность: " + String(contestia_session_duration_sec) + " сек.");    
+          }    
+        }    
+      }    
+    
+      // ГАРАНТИРОВАННЫЙ БЛОК ВЫХОДА ИЗ СЕАНСА    
+      is_transmitting = false;    
+      scheduled_freq_hz = 0;    
+      SI_POWER_OFF();    
+      dev_TX_state = false;    
+      update_scheduler();    
+    }    
+  }
+
+
+// =========================================================================  
+  // РЕЖИМ 4. СЕАНС СВЯЗИ THOR 11 
+  // =========================================================================  
+  if (( (is_time_to_transmit(MODE_THOR) && !is_transmitting) || force_thor_transmission) && !pc_file_written && !soft_restart_flag) {  
+    force_thor_transmission = false;  
+    is_transmitting = true;  
+    tx_launching = false; // Сбрасываем защитный флаг сразу после фиксации is_transmitting  
+  
+    if (debug_flag) {  
+      char time_buf[128];  
+      snprintf(time_buf, sizeof(time_buf), "[Система] %02d:%02d:%02d - Наступило время сеанса THOR! Выходим в эфир...", rtc_hour, rtc_min, rtc_sec);  
+      Serial.println(time_buf);  
+    }  
+  
+    if ((my_call_variable.length() > 0 || my_text_variable.length() > 0) && !soft_restart_flag) {
+  
+      uint32_t thor_session_start_ms = millis();
+      dev_TX_state = true;
+      update_scheduler();
+      SI_POWER_ON();
+  
+      if (!pc_file_written && !soft_restart_flag) {
+        uint32_t thor_hz = (scheduled_freq_hz > 0) ? scheduled_freq_hz           // приоритет частоте из расписания  
+                   : strtoul(my_freq_thor_var.c_str(), NULL, 10);  
+        if (thor_hz == 0) thor_hz = 3601307;  
+  
+        prepare_thor_frequencies(thor_hz);  
+  
+        // THOR: позывной и локатор  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_THOR] Вызов: "));  
+          thor_send_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n");  
+        }  
+  
+        // THOR: основной текст  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_THOR] Текст: "));  
+          thor_send_string(my_text_variable + "\r\n");  
+        }  
+  
+        // THOR: первая телеметрия  
+        if (!pc_file_written && !soft_restart_flag) {  
+          String telemetry = get_telemetry_string();  
+          Serial.print(F("[ЭФИР_THOR] Телем: "));  
+          thor_send_string(telemetry);  
+        }  
+  
+        // THOR: климатическая телеметрия  
+        if (!pc_file_written && !soft_restart_flag) {  
+          if (device_BM[0] == 1) {  
+            String telemetry = get_climate_telemetry();  
+            Serial.print(F("[ЭФИР_THOR] Телем: "));  
+            thor_send_string(telemetry);  
+          } else {  
+            Serial.println(F("[Система] отсутствует климатический модуль. Погодная телеметрия не передаётся"));  
+          }  
+        }  
+  
+        // THOR: завершение  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_THOR] Конец: "));  
+          thor_send_string("OVER.\r\n\r\n");  
+        }  
+  
+        if (!pc_file_written && !soft_restart_flag) {  
+          uint32_t thor_session_duration_sec = (millis() - thor_session_start_ms) / 1000;  
+          update_scheduler();  
+          char end_buf[128];  
+          snprintf(end_buf, sizeof(end_buf), "[Система] %02d:%02d:%02d - Сеанс THOR завершен. Длительность: %lu сек.", rtc_hour, rtc_min, rtc_sec, thor_session_duration_sec);  
+          Serial.println(end_buf);  
+          if (debug_flag) {  
+            log_file_write_line("Сеанс THOR завершен. Длительность: " + String(thor_session_duration_sec) + " сек.");  
+          }  
+        }  
+      }  
+  
+      // ГАРАНТИРОВАННЫЙ БЛОК ВЫХОДА ИЗ СЕАНСА  
+      is_transmitting = false;  
+      scheduled_freq_hz = 0;  
+      SI_POWER_OFF();  
+      dev_TX_state = false;  
+      update_scheduler();  
+    }  
+  }
+
+
+// =========================================================================  
+  // РЕЖИМ 6. СЕАНС СВЯЗИ MFSK16 
+  // =========================================================================  
+  if (( (is_time_to_transmit(MODE_MFSK16) && !is_transmitting) || force_mfsk16_transmission) && !pc_file_written && !soft_restart_flag) {  
+    force_mfsk16_transmission = false;  
+    is_transmitting = true;  
+    tx_launching = false; // Сбрасываем защитный флаг сразу после фиксации is_transmitting  
+  
+    if (debug_flag) {  
+      char time_buf[128];  
+      snprintf(time_buf, sizeof(time_buf), "[Система] %02d:%02d:%02d - Наступило время сеанса MFSK16! Выходим в эфир...", rtc_hour, rtc_min, rtc_sec);  
+      Serial.println(time_buf);  
+    }  
+  
+    if ((my_call_variable.length() > 0 || my_text_variable.length() > 0) && !soft_restart_flag) {
+  
+      uint32_t mfsk16_session_start_ms = millis();
+      dev_TX_state = true;
+      update_scheduler();
+      SI_POWER_ON();
+  
+      if (!pc_file_written && !soft_restart_flag) {
+        uint32_t mfsk16_hz = (scheduled_freq_hz > 0) ? scheduled_freq_hz           // приоритет частоте из расписания  
+                   : strtoul(my_freq_mfsk16_var.c_str(), NULL, 10);  
+        if (mfsk16_hz == 0) mfsk16_hz = 3601307;  
+  
+        prepare_mfsk16_frequencies(mfsk16_hz);  
+  
+        // MFSK16: позывной и локатор  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_MFSK16] Вызов: "));  
+          mfsk16_send_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n");  
+        }  
+  
+        // MFSK16: основной текст  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_MFSK16] Текст: "));  
+          mfsk16_send_string(my_text_variable + "\r\n");  
+        }  
+  
+        // MFSK16: первая телеметрия  
+        if (!pc_file_written && !soft_restart_flag) {  
+          String telemetry = get_telemetry_string();  
+          Serial.print(F("[ЭФИР_MFSK16] Телем: "));  
+          mfsk16_send_string(telemetry);  
+        }  
+  
+        // MFSK16: климатическая телеметрия  
+        if (!pc_file_written && !soft_restart_flag) {  
+          if (device_BM[0] == 1) {  
+            String telemetry = get_climate_telemetry();  
+            Serial.print(F("[ЭФИР_MFSK16] Телем: "));  
+            mfsk16_send_string(telemetry);  
+          } else {  
+            Serial.println(F("[Система] отсутствует климатический модуль. Погодная телеметрия не передаётся"));  
+          }  
+        }  
+  
+        // MFSK16: завершение  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_MFSK16] Конец: "));  
+          mfsk16_send_string("OVER.\r\n\r\n");  
+        }  
+  
+        if (!pc_file_written && !soft_restart_flag) {  
+          uint32_t mfsk16_session_duration_sec = (millis() - mfsk16_session_start_ms) / 1000;  
+          update_scheduler();  
+          char end_buf[128];  
+          snprintf(end_buf, sizeof(end_buf), "[Система] %02d:%02d:%02d - Сеанс MFSK16 завершен. Длительность: %lu сек.", rtc_hour, rtc_min, rtc_sec, mfsk16_session_duration_sec);  
+          Serial.println(end_buf);  
+          if (debug_flag) {  
+            log_file_write_line("Сеанс MFSK16 завершен. Длительность: " + String(mfsk16_session_duration_sec) + " сек.");  
+          }  
+        }  
+      }  
+  
+      // ГАРАНТИРОВАННЫЙ БЛОК ВЫХОДА ИЗ СЕАНСА  
+      is_transmitting = false;  
+      scheduled_freq_hz = 0;  
+      SI_POWER_OFF();  
+      dev_TX_state = false;  
+      update_scheduler();  
+    }  
+  }
+
+
+// =========================================================================  
+  // РЕЖИМ 7. СЕАНС СВЯЗИ DOMINOEX 8 
+  // =========================================================================  
+  if (( (is_time_to_transmit(MODE_DOMINOEX) && !is_transmitting) || force_dominoex_transmission) && !pc_file_written && !soft_restart_flag) {  
+    force_dominoex_transmission = false;  
+    is_transmitting = true;  
+    tx_launching = false; // Сбрасываем защитный флаг сразу после фиксации is_transmitting  
+  
+    if (debug_flag) {  
+      char time_buf[128];  
+      snprintf(time_buf, sizeof(time_buf), "[Система] %02d:%02d:%02d - Наступило время сеанса DOMINOEX! Выходим в эфир...", rtc_hour, rtc_min, rtc_sec);  
+      Serial.println(time_buf);  
+    }  
+  
+    if ((my_call_variable.length() > 0 || my_text_variable.length() > 0) && !soft_restart_flag) {
+  
+      uint32_t dominoex_session_start_ms = millis();
+      dev_TX_state = true;
+      update_scheduler();
+      SI_POWER_ON();
+  
+      if (!pc_file_written && !soft_restart_flag) {
+        uint32_t dominoex_hz = (scheduled_freq_hz > 0) ? scheduled_freq_hz           // приоритет частоте из расписания  
+                   : strtoul(my_freq_dominoex_var.c_str(), NULL, 10);  
+        if (dominoex_hz == 0) dominoex_hz = 3601307;  
+  
+        prepare_dominoex_frequencies(dominoex_hz);  
+  
+        // DOMINOEX: позывной и локатор  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_DOMINOEX] Вызов: "));  
+          dominoex_send_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n");  
+        }  
+  
+        // DOMINOEX: основной текст  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_DOMINOEX] Текст: "));  
+          dominoex_send_string(my_text_variable + "\r\n");  
+        }  
+  
+        // DOMINOEX: первая телеметрия  
+        if (!pc_file_written && !soft_restart_flag) {  
+          String telemetry = get_telemetry_string();  
+          Serial.print(F("[ЭФИР_DOMINOEX] Телем: "));  
+          dominoex_send_string(telemetry);  
+        }  
+  
+        // DOMINOEX: климатическая телеметрия  
+        if (!pc_file_written && !soft_restart_flag) {  
+          if (device_BM[0] == 1) {  
+            String telemetry = get_climate_telemetry();  
+            Serial.print(F("[ЭФИР_DOMINOEX] Телем: "));  
+            dominoex_send_string(telemetry);  
+          } else {  
+            Serial.println(F("[Система] отсутствует климатический модуль. Погодная телеметрия не передаётся"));  
+          }  
+        }  
+  
+        // DOMINOEX: завершение  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_DOMINOEX] Конец: "));  
+          dominoex_send_string("OVER.\r\n\r\n");  
+        }  
+  
+        if (!pc_file_written && !soft_restart_flag) {  
+          uint32_t dominoex_session_duration_sec = (millis() - dominoex_session_start_ms) / 1000;  
+          update_scheduler();  
+          char end_buf[128];  
+          snprintf(end_buf, sizeof(end_buf), "[Система] %02d:%02d:%02d - Сеанс DOMINOEX завершен. Длительность: %lu сек.", rtc_hour, rtc_min, rtc_sec, dominoex_session_duration_sec);  
+          Serial.println(end_buf);  
+          if (debug_flag) {  
+            log_file_write_line("Сеанс DOMINOEX завершен. Длительность: " + String(dominoex_session_duration_sec) + " сек.");  
+          }  
+        }  
+      }  
+  
+      // ГАРАНТИРОВАННЫЙ БЛОК ВЫХОДА ИЗ СЕАНСА  
+      is_transmitting = false;  
+      scheduled_freq_hz = 0;  
+      SI_POWER_OFF();  
+      dev_TX_state = false;  
+      update_scheduler();  
+    }  
+  }
+
+
+// =========================================================================  
+  // РЕЖИМ 8. СЕАНС СВЯЗИ FSQ-4.5 
+  // =========================================================================  
+  if (( (is_time_to_transmit(MODE_FSQ) && !is_transmitting) || force_fsq_transmission) && !pc_file_written && !soft_restart_flag) {  
+    force_fsq_transmission = false;  
+    is_transmitting = true;  
+    tx_launching = false; // Сбрасываем защитный флаг сразу после фиксации is_transmitting  
+  
+    if (debug_flag) {  
+      char time_buf[128];  
+      snprintf(time_buf, sizeof(time_buf), "[Система] %02d:%02d:%02d - Наступило время сеанса FSQ! Выходим в эфир...", rtc_hour, rtc_min, rtc_sec);  
+      Serial.println(time_buf);  
+    }  
+  
+    if ((my_call_variable.length() > 0 || my_text_variable.length() > 0) && !soft_restart_flag) {
+  
+      uint32_t fsq_session_start_ms = millis();
+      dev_TX_state = true;
+      update_scheduler();
+      SI_POWER_ON();
+  
+      if (!pc_file_written && !soft_restart_flag) {
+        uint32_t fsq_hz = (scheduled_freq_hz > 0) ? scheduled_freq_hz           // приоритет частоте из расписания  
+                   : strtoul(my_freq_fsq_var.c_str(), NULL, 10);  
+        if (fsq_hz == 0) fsq_hz = 3601307;  
+  
+        prepare_fsq_frequencies(fsq_hz);  
+  
+        // FSQ: позывной и локатор  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_FSQ] Вызов: "));  
+          fsq_send_string("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n");  
+        }  
+  
+        // FSQ: основной текст  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_FSQ] Текст: "));  
+          fsq_send_string(my_text_variable + "\r\n");  
+        }  
+  
+        // FSQ: первая телеметрия  
+        if (!pc_file_written && !soft_restart_flag) {  
+          String telemetry = get_telemetry_string();  
+          Serial.print(F("[ЭФИР_FSQ] Телем: "));  
+          fsq_send_string(telemetry);  
+        }  
+  
+        // FSQ: климатическая телеметрия  
+        if (!pc_file_written && !soft_restart_flag) {  
+          if (device_BM[0] == 1) {  
+            String telemetry = get_climate_telemetry();  
+            Serial.print(F("[ЭФИР_FSQ] Телем: "));  
+            fsq_send_string(telemetry);  
+          } else {  
+            Serial.println(F("[Система] отсутствует климатический модуль. Погодная телеметрия не передаётся"));  
+          }  
+        }  
+  
+        // FSQ: завершение  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_FSQ] Конец: "));  
+          fsq_send_string("OVER.\r\n\r\n");  
+        }  
+  
+        if (!pc_file_written && !soft_restart_flag) {  
+          uint32_t fsq_session_duration_sec = (millis() - fsq_session_start_ms) / 1000;  
+          update_scheduler();  
+          char end_buf[128];  
+          snprintf(end_buf, sizeof(end_buf), "[Система] %02d:%02d:%02d - Сеанс FSQ завершен. Длительность: %lu сек.", rtc_hour, rtc_min, rtc_sec, fsq_session_duration_sec);  
+          Serial.println(end_buf);  
+          if (debug_flag) {  
+            log_file_write_line("Сеанс FSQ завершен. Длительность: " + String(fsq_session_duration_sec) + " сек.");  
+          }  
+        }  
+      }  
+  
+      // ГАРАНТИРОВАННЫЙ БЛОК ВЫХОДА ИЗ СЕАНСА  
+      is_transmitting = false;  
+      scheduled_freq_hz = 0;  
+      SI_POWER_OFF();  
+      dev_TX_state = false;  
+      update_scheduler();  
+    }  
+  }
+
+// =========================================================================    
+  // РЕЖИМ 9. СЕАНС СВЯЗИ JTTY (WSJT-X 3.3)  
+  // =========================================================================    
+  if (( (is_time_to_transmit(MODE_JTTY) && !is_transmitting) || force_jtty_transmission) && !pc_file_written && !soft_restart_flag) {    
+    force_jtty_transmission = false;    
+    is_transmitting = true;    
+    tx_launching = false; // Сбрасываем защитный флаг сразу после фиксации is_transmitting    
+    
+    if (debug_flag) {    
+      char time_buf[128];    
+      snprintf(time_buf, sizeof(time_buf), "[Система] %02d:%02d:%02d - Наступило время сеанса JTTY! Выходим в эфир...", rtc_hour, rtc_min, rtc_sec);    
+      Serial.println(time_buf);    
+    }    
+    
+    if ((my_call_variable.length() > 0 || my_text_variable.length() > 0) && !soft_restart_flag) {  
+    
+      uint32_t jtty_session_start_ms = millis();  
+      dev_TX_state = true;  
+      update_scheduler();  
+      SI_POWER_ON();  
+    
+      if (!pc_file_written && !soft_restart_flag) {  
+        uint32_t jtty_hz = (scheduled_freq_hz > 0) ? scheduled_freq_hz           // приоритет частоте из расписания    
+                   : strtoul(my_freq_jtty_var.c_str(), NULL, 10);    
+        if (jtty_hz == 0) jtty_hz = 14079000;    
+    
+        prepare_jtty_frequencies(jtty_hz);
+    
+        // JTTY: позывной и локатор  
+        if (!pc_file_written && !soft_restart_flag) {
+          String call_msg = "VVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable;
+          Serial.print(F("[ЭФИР_JTTY] Вызов: ")); Serial.println(call_msg);  
+          jtty_send_string(call_msg.c_str());  
+        }
+   
+        // JTTY: основной текст (TEXT5-кадры)  
+        if (!pc_file_written && !soft_restart_flag && my_text_variable.length() > 0) {    
+          Serial.print(F("[ЭФИР_JTTY] Текст: ")); Serial.println(my_text_variable);  
+          jtty_send_string(my_text_variable.c_str());
+        }    
+
+        // JTTY: первая телеметрия  
+        if (!pc_file_written && !soft_restart_flag) {  
+          String telemetry = get_telemetry_string();
+          Serial.print(F("[ЭФИР_JTTY] Текст: ")); Serial.println(telemetry);  
+          jtty_send_string(telemetry.c_str());
+        }  
+
+        // JTTY: климатическая телеметрия  
+        if (!pc_file_written && !soft_restart_flag) {  
+          if (device_BM[0] == 1) {  
+            String telemetry = get_climate_telemetry();  
+            Serial.print(F("[ЭФИР_JTTY] Текст: ")); Serial.println(telemetry);  
+            jtty_send_string(telemetry.c_str());
+          } else {  
+            Serial.println(F("[Система] отсутствует климатический модуль. Погодная телеметрия не передаётся"));  
+          }  
+        }  
+
+        // JTTY: завершение  
+        if (!pc_file_written && !soft_restart_flag) {  
+          String over_msg = "OVER";
+          Serial.print(F("[ЭФИР_JTTY] Вызов: ")); Serial.println(over_msg);  
+          jtty_send_string(over_msg.c_str());  
+        }  
+
+        if (!pc_file_written && !soft_restart_flag) {    
+          uint32_t jtty_session_duration_sec = (millis() - jtty_session_start_ms) / 1000;    
+          update_scheduler();    
+          char end_buf[128];    
+          snprintf(end_buf, sizeof(end_buf), "[Система] %02d:%02d:%02d - Сеанс JTTY завершен. Длительность: %lu сек.", rtc_hour, rtc_min, rtc_sec, jtty_session_duration_sec);    
+          Serial.println(end_buf);    
+          if (debug_flag) {    
+            log_file_write_line("Сеанс JTTY завершен. Длительность: " + String(jtty_session_duration_sec) + " сек.");    
+          }    
+        }    
+      }    
+    
+      // ГАРАНТИРОВАННЫЙ БЛОК ВЫХОДА ИЗ СЕАНСА    
+      is_transmitting = false;    
+      scheduled_freq_hz = 0;    
+      SI_POWER_OFF();    
+      dev_TX_state = false;    
+      update_scheduler();    
+    }    
+  }
+
+
+// =========================================================================  
+  // РЕЖИМ N. СЕАНС СВЯЗИ AX.25 300 bd  
+  // =========================================================================  
+  if ((force_ax25_transmission) && !is_transmitting && !pc_file_written && !soft_restart_flag) {  
+    force_ax25_transmission = false;  
+    is_transmitting = true;  
+    tx_launching = false;  
+  
+    if ((my_call_variable.length() > 0 || my_text_variable.length() > 0) && !soft_restart_flag) {  
+  
+      uint32_t ax25_session_start_ms = millis();  
+      dev_TX_state = true;  
+      update_scheduler();  
+      SI_POWER_ON();  
+  
+      if (!pc_file_written && !soft_restart_flag) {  
+        uint32_t ax25_hz = (scheduled_freq_hz > 0) ? scheduled_freq_hz  
+                   : strtoul(my_freq_ax25_var.c_str(), NULL, 10);  
+        if (ax25_hz == 0) ax25_hz = 14079000;  
+  
+        bool ax25_invert = (my_ax25_invert_var == "1");  
+        prepare_ax25_frequencies(ax25_hz, ax25_invert);  
+  
+        Serial.print(F("[AX25] 300 bd, AFSK 1200/2200, центр: "));  
+        Serial.print(ax25_hz); Serial.println(F(" Гц"));  
+  
+        // ШАГ 1: позывной и локатор — один UI-frame  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_AX25] Вызов: "));  
+          send_ax25_packet("\r\n\r\nVVV BEACON DE " + my_call_variable + "/B DE " + my_call_variable + "/B, QTH " + my_qth_variable + " " + my_qth_variable + " \r\n"); 
+        }  
+
+        // ШАГ 2: основной текст  
+        if (!pc_file_written && !soft_restart_flag) {  
+          Serial.print(F("[ЭФИР_AX25] Текст: "));  
+          send_ax25_packet(my_text_variable);  
+        }  
+  
+        // ШАГ 3: телеметрия  
+        if (!pc_file_written && !soft_restart_flag) {  
+          String telemetry = get_telemetry_string();  
+          Serial.print(F("[ЭФИР_AX25] Телем: "));  
+          send_ax25_packet(telemetry);  
+        }  
+  
+        // ШАГ 4: климатическая телеметрия  
+        if (!pc_file_written && !soft_restart_flag) {  
+          if (device_BM[0] == 1) {  
+            Serial.print(F("[ЭФИР_AX25] Телем: "));  
+            send_ax25_packet(get_climate_telemetry());  
+          } else {  
+            Serial.println(F("[Система] отсутствует климатический модуль. Погодная телеметрия не передаётся"));  
+          }  
+        }  
+  
+        if (!pc_file_written && !soft_restart_flag) {  
+          uint32_t ax25_session_duration_sec = (millis() - ax25_session_start_ms) / 1000;  
+          update_scheduler();  
+          char end_buf[128];  
+          snprintf(end_buf, sizeof(end_buf), "[Система] %02d:%02d:%02d - Сеанс AX.25 завершен. Длительность: %lu сек.", rtc_hour, rtc_min, rtc_sec, ax25_session_duration_sec);  
+          Serial.println(end_buf);  
+          if (debug_flag) {  
+            log_file_write_line("Сеанс AX.25 завершен. Длительность: " + String(ax25_session_duration_sec) + " сек.");  
+          }  
+        }  
+      }  
+  
+      // ГАРАНТИРОВАННЫЙ БЛОК ВЫХОДА ИЗ СЕАНСА  
+      is_transmitting = false;  
+      scheduled_freq_hz = 0;  
+      SI_POWER_OFF();  
+      dev_TX_state = false;  
+      update_scheduler();  
+    }  
+  }
+
+
+  // =========================================================================
+  // РЕЖИМ 254. ЦЕПОЧКА
+  // =========================================================================
+  // Проверка запуска трехмодовой цепочки из расписания
+  if ((is_time_to_transmit(254) && !is_transmitting) && !pc_file_written && !soft_restart_flag) {
+       Serial.println(F("[Планировщик] Время подошло. Запуск сквозной цепочки CW -> RTTY -> IFKP"));
+       is_transmitting = true;
+       tx_launching = false; // Сбрасываем защитный флаг сразу после фиксации is_transmitting
+       usr_chain_state = USR_START_CW; // Толкаем ваш штатный автомат, он всё сделает сам!
+  }
+
+
+  delay(1); 
+}
+
+
+
+// RP2040_beacon.ino — выравнивание колонок в отчёте [SCAN_RESULT]  
+static String fmt_dev(const char* name, const char* addr, int sda, int scl) {  
+  char buf[48];  
+  // %-8s — имя слева до 8 симв.; %-4s — адрес; %2d — пины по правому краю  
+  snprintf(buf, sizeof(buf), "%-8s(%-4s SDA:%2d SCL:%2d)", name, addr, sda, scl);  
+  return String(buf);  
+}
+
+// Сбор результатов сканирования с фиксацией физических пинов SDA/SCL и их экспорт в файл конфигурации железа
+void I2C_Scanner() {
+  // Первично производим аппаратный обход портов I2C
+  scanRP2040Ports();
+  printDeviceTable();
+
+  // Формируем строку отчёта. Каждое устройство пишется с новой строки (\r\n)
+  String results = "";
+  
+  if (device_SI[0] == 1) {
+    if (results.length() > 0) results += "\r\n";
+    results += fmt_dev("SI5351", "0x60", device_SI[2], device_SI[3]);
+  }
+  if (device_DS[0] == 1) {
+    if (results.length() > 0) results += "\r\n";
+    results += fmt_dev(rtc_chip_name.c_str(), "0x68", device_DS[2], device_DS[3]); 
+  }
+  if (device_AT[0] == 1) {
+    if (results.length() > 0) results += "\r\n";
+    char addr_buf[8];
+    snprintf(addr_buf, sizeof(addr_buf), "0x%02X", device_AT[4]);
+    results += fmt_dev("EEPROM", addr_buf, device_AT[2], device_AT[3]);
+  }
+  if (device_BM[0] == 1) {
+    if (results.length() > 0) results += "\r\n";
+    char addr_buf[8];
+    snprintf(addr_buf, sizeof(addr_buf), "0x%02X", device_BM[4]);
+    results += fmt_dev("BME/BMP", addr_buf, device_BM[2], device_BM[3]);
+  }
+  if (device_AH[0] == 1) {
+    if (results.length() > 0) results += "\r\n";
+    results += fmt_dev("AHT20", "0x38", device_AH[2], device_AH[3]);
+  }
+  if (device_DL[0] == 1) {
+    if (results.length() > 0) results += "\r\n";
+    results += fmt_dev("LCD", "0x27", device_DL[2], device_DL[3]);
+  }
+  
+  results.trim();
+  if (results.length() == 0) {
+    results = "Устройства на шине I2C не обнаружены";
+  }
+
+  // Записываем результат и обновляем файл на диске
+  save_hardware_settings_to_file(results);
+  
+  if (debug_flag) {
+    // вывод сообщения
+    Serial.println(F("[Система] Результаты I2C сканирования экспортированы в SET.TXT"));
+  }
+}
+
+void scanRP2040Ports() {
+  // Serial.println(F("\n=== ЗАПУСК ПОЛНОГО СКАНИРОВАНИЯ РАЗРЕШЕННЫХ ПОРТОВ RP2040-ZERO ==="));
+
+  // Шаг 1: Сканируем шину i2c0 
+  // SDA: 0, SCL: 1 (Удобные боковые пины)
+  // SDA: 4, SCL: 5 (Удобные боковые пины)
+  // SDA: 8, SCL: 9 (Удобные боковые пины)
+  // SDA: 12, SCL: 13 (Удобные боковые пины)
+  // SDA: 20, SCL: 21 (Задние площадки под пайку)
+
+  for (uint8_t sda = 0; sda <= 27; sda += 4) {
+    uint8_t scl = sda + 1;
+    
+    // ИСКЛЮЧЕНИЯ ДЛЯ RP2040-ZERO:
+    //if (sda == 16 || scl == 16) continue;
+    //if (sda >= 23 && sda <= 25) continue;
+    //if (scl >= 23 && scl <= 25) continue;
+
+    // Проверяем кастомный список исключений из SET.TXT
+    if (is_pin_excluded_from_scan(sda) || is_pin_excluded_from_scan(scl)) {
+      //Serial.print(F("[Сканер]  Пропуск исключенных пинов: ")); Serial.print(sda); Serial.print(F(", ")); Serial.println(scl);
+      continue;
+    }
+    if (debug_flag) {
+        I2C_Scan_module(0, sda, scl, true); }
+      else {
+        I2C_Scan_module(0, sda, scl, false);
+      }
+    delay(50);
+  }
+
+  // Шаг 2: Сканируем шину i2c1
+  // SDA: 2, SCL: 3 (Удобные боковые пины)
+  // SDA: 6, SCL: 7 (Удобные боковые пины)
+  // SDA: 10, SCL: 11 (Удобные боковые пины)
+  // SDA: 14, SCL: 15 (Удобные боковые пины)
+  // SDA: 18, SCL: 19 (Задние площадки под пайку)
+  // SDA: 26, SCL: 27 (Нижние аналоговые пины)
+  for (uint8_t sda = 2; sda <= 26; sda += 4) {
+    uint8_t scl = sda + 1;
+    if (is_pin_excluded_from_scan(sda) || is_pin_excluded_from_scan(scl)) {
+      //Serial.print(F("[Сканер]  Пропуск исключенных пинов: ")); Serial.print(sda); Serial.print(F(", ")); Serial.println(scl);
+      continue;
+    }
+    if (debug_flag) {
+        I2C_Scan_module(1, sda, scl, true); }
+      else {
+        I2C_Scan_module(1, sda, scl, false);
+      } 
+    delay(50);
+  }
+}
+
+void I2C_Scan_module(int WIRE_NO, int PIN_SDA, int PIN_SCL, bool LOGGING) {
+  watchdog_update(); // сброс сторожевого таймера
+  // сканер устройств на указанной шине I2C
+  byte error, address;
+  int nDevices = 0;
+
+  // Выбираем нужный интерфейс Wire в зависимости от WIRE_NO
+  TwoWire *pWire = (WIRE_NO == 1) ? &Wire1 : &Wire;
+
+  // Настройка пинов и старт шины I2C
+  pWire->end();
+  pWire->setSDA(PIN_SDA);
+  pWire->setSCL(PIN_SCL);
+  pWire->begin();
+  pWire->setClock(400000);
+
+  if (LOGGING) {
+    Serial.print("[Система] Сканирование шины I2C-"); Serial.print(WIRE_NO); Serial.print(" на пинах SDA=");
+    Serial.print(PIN_SDA); Serial.print(", SCL="); Serial.print(PIN_SCL); Serial.println(":");
+  }
+
+  for (address = 1; address < 127; address++) {
+    // Первичная проверка присутствия прибора по ACK
+    pWire->beginTransmission(address);
+    error = pWire->endTransmission();
+
+    if (error == 0) {
+      // Инициализируем локальный флаг глубокой проверки
+      bool hardware_verified = false;
+
+      // =========================================================================
+      // 1. УСИЛЕННАЯ ВЕРИФИКАЦИЯ СИНТЕЗАТОРА SI5351 (0x60)
+      // =========================================================================
+      if (address == 0x60) {
+        byte revid = 0;
+        pWire->beginTransmission(address);
+        pWire->write(0x00); // Регистр ревизии чипа / Device Status
+        if (pWire->endTransmission() == 0) {
+          // Запрашиваем 1 байт и строго проверяем успешность транзакции шины
+          if (pWire->requestFrom(address, (uint8_t)1) == 1 && pWire->available()) {
+            byte reg0 = pWire->read();
+            revid = reg0 & 0x03;
+            hardware_verified = true; // Устройство физически ответило байтом данных!
+            
+            if (LOGGING) { 
+              Serial.print("[Система] - найден прибор 0x60: Si5351 ревизии "); 
+              Serial.println(revid); 
+            }
+          }
+        }
+        
+        if (hardware_verified) {
+          device_SI[0] = 1;
+          device_SI[1] = WIRE_NO;
+          device_SI[2] = PIN_SDA;
+          device_SI[3] = PIN_SCL;
+          device_SI[4] = address;
+          device_SI_name = "SI5351 Генератор";
+        }
+      }
+
+      // =========================================================================
+      // 2. УСИЛЕННАЯ ВЕРИФИКАЦИЯ ЧАСОВ RTC DS3231 / DS1307 (0x68)
+      // =========================================================================
+      else if (address == 0x68) {
+        extern String rtc_chip_name;
+        pWire->beginTransmission(address);
+        pWire->write(0x0F); // Регистр управления/статуса
+        pWire->write(0x70); 
+        if (pWire->endTransmission() == 0) {
+          pWire->beginTransmission(address);
+          pWire->write(0x0F);
+          pWire->endTransmission();
+          
+          // Проверяем, вернулся ли ровно 1 байт без обрыва связи
+          if (pWire->requestFrom(address, (uint8_t)1) == 1 && pWire->available()) {
+            uint8_t testByte = pWire->read();
+            hardware_verified = true; // Пробное чтение прошло успешно
+
+            if ((testByte & 0x70) == 0x70) {
+              rtc_chip_name = "DS1307";
+              pWire->beginTransmission(address);
+              pWire->write(0x0F); pWire->write(0x00); // Чистим NVRAM регистр за собой
+              pWire->endTransmission();
+            } else {
+              rtc_chip_name = "DS3231";
+            }
+            if (LOGGING) { 
+              Serial.print("[Система] - найден прибор 0x68: Часы "); 
+              Serial.println(rtc_chip_name); 
+            }
+          }
+        }
+        
+        if (hardware_verified) {
+          device_DS[0] = 1;
+          device_DS[1] = WIRE_NO;
+          device_DS[2] = PIN_SDA;
+          device_DS[3] = PIN_SCL;
+          device_DS[4] = address;
+          device_DS_name = rtc_chip_name + " Часы RTC";
+        }
+      }
+
+      // =========================================================================
+      // 3. УСИЛЕННАЯ ВЕРИФИКАЦИЯ ЭНЕРГОНЕЗАВИСИМОЙ ПАМЯТИ AT24Cxx (0x50..0x57)
+      // =========================================================================
+      else if (address >= 0x50 && address <= 0x57) {
+        pWire->beginTransmission(address);
+        pWire->write(0x00); pWire->write(0x00); // Выставляем указатель на адрес ячейки 0
+        if (pWire->endTransmission() == 0) {
+          // Выполняем строгое верификационное чтение первого байта памяти
+          if (pWire->requestFrom(address, (uint8_t)1) == 1 && pWire->available()) {
+            uint8_t byte0 = pWire->read();
+            hardware_verified = true; // Микросхема памяти подтверждена!
+
+            int kbits = 512; 
+            int sizesToTest[] = {32, 64, 128, 256}; 
+
+            for (int i = 0; i < 4; i++) {
+              uint16_t testAddr = (sizesToTest[i] * 128); 
+              pWire->beginTransmission(address);
+              pWire->write((uint8_t)(testAddr >> 8)); pWire->write((uint8_t)(testAddr & 0xFF));
+              
+              if (pWire->endTransmission() == 0 && pWire->requestFrom(address, (uint8_t)1) == 1 && pWire->available()) {
+                uint8_t testByte = pWire->read();
+                if (testByte == byte0) {
+                  pWire->beginTransmission(address);
+                  pWire->write(0x00); pWire->write(0x00); pWire->write((uint8_t)~byte0);
+                  pWire->endTransmission();
+                  delay(5); 
+
+                  pWire->beginTransmission(address);
+                  pWire->write((uint8_t)(testAddr >> 8)); pWire->write((uint8_t)(testAddr & 0xFF));
+                  pWire->endTransmission();
+                  
+                  if (pWire->requestFrom(address, (uint8_t)1) == 1 && pWire->available() && pWire->read() == (uint8_t)~byte0) {
+                    kbits = sizesToTest[i];
+                    pWire->beginTransmission(address);
+                    pWire->write(0x00); pWire->write(0x00); pWire->write(byte0);
+                    pWire->endTransmission();
+                    delay(5);
+                    break;
+                  }
+                  pWire->beginTransmission(address);
+                  pWire->write(0x00); pWire->write(0x00); pWire->write(byte0);
+                  pWire->endTransmission();
+                  delay(5);
+                }
+              }
+            }
+            if (LOGGING) {
+              Serial.print("[Система] - найден прибор 0x"); Serial.print(address, HEX);
+              Serial.print(": EEPROM AT24C"); Serial.print(kbits);
+              Serial.print(" ("); Serial.print(kbits / 8); Serial.println(" Кбайт)");
+            }
+            device_AT[0] = 1;
+            device_AT[1] = WIRE_NO;
+            device_AT[2] = PIN_SDA;
+            device_AT[3] = PIN_SCL;
+            device_AT[4] = address;
+            device_AT_name = "EEPROM AT24C" + String(kbits) + " " + String(kbits/8) + "Кб";
+          }
+        }
+      }
+
+      // =========================================================================
+      // 4. УСИЛЕННАЯ ВЕРИФИКАЦИЯ ДИСПЛЕЯ LCD1602 (0x27) ЧЕРЕЗ ПРОВЕРКУ ФЛАНГА ШИНЫ
+      // =========================================================================
+      else if (address == 0x27) {
+        // Микросхема расширителя PCF8574 всегда возвращает 1 байт состояния пинов при чтении
+        if (pWire->requestFrom(address, (uint8_t)1) == 1) {
+          hardware_verified = true; // Экран подтвердил своё присутствие
+
+          if (LOGGING) { Serial.println("[Система] - найден прибор 0x27: LCD Дисплей (PCF8574). Инициализация..."); }
+          device_DL[0] = 1;
+          device_DL[1] = WIRE_NO;
+          device_DL[2] = PIN_SDA;
+          device_DL[3] = PIN_SCL;
+          device_DL[4] = address;
+          device_DL_name = "H44780 LCD Дисплей";
+          
+          pWire->end();
+          LCD_init(true);
+          LCD_print("I2C Scan: OK!", 0, 0);
+          LCD_print("Display Active", 1, 0);
+          pWire->begin();
+          pWire->setClock(400000);
+        }
+      }
+
+      // =========================================================================
+      // 5. УСИЛЕННАЯ ВЕРИФИКАЦИЯ КЛИМАТИЧЕСКИХ ДАТЧИКОВ BME280 / BMP280 / BMP180
+      // =========================================================================
+      else if (address == 0x76 || address == 0x77) {
+        uint8_t reg_id_addr = (address == 0x76 || address == 0x77) ? 0xD0 : 0xD0; // Идентификационный регистр Chip ID
+        pWire->beginTransmission(address);
+        pWire->write(reg_id_addr);
+        if (pWire->endTransmission() == 0) {
+          // Запрашиваем уникальный заводской ID датчика
+          if (pWire->requestFrom(address, (uint8_t)1) == 1 && pWire->available()) {
+            uint8_t chipID = pWire->read();
+            hardware_verified = true; // Датчик физически прочитан!
+
+            if (chipID == 0x60) {
+              device_BM_name = "BME280 Гигрометр";
+            } else if (chipID == 0x58 || chipID == 0x56 || chipID == 0x57) {
+              device_BM_name = "BMP280 Барометр";
+            } else if (chipID == 0x55 && address == 0x77) {
+              device_BM_name = "BMP180 Барометр";
+            } else {
+              device_BM_name = "Неизвестный климатический чип ID:0x" + String(chipID, HEX);
+            }
+
+            if (LOGGING) { 
+              Serial.print("[Система] - найден прибор 0x"); Serial.print(address, HEX);
+              Serial.print(": "); Serial.println(device_BM_name); 
+            }
+
+            device_BM[0] = 1;
+            device_BM[1] = WIRE_NO;
+            device_BM[2] = PIN_SDA;
+            device_BM[3] = PIN_SCL;
+            device_BM[4] = address;
+          }
+        }
+      }
+
+      // =========================================================================
+      // 6. УСИЛЕННАЯ ВЕРИФИКАЦИЯ ДАТЧИКА ВЛАЖНОСТИ И ТЕМПЕРАТУРЫ AHT20 (0x38)
+      // =========================================================================
+      else if (address == AHT20_ADDRESS) {
+        pWire->beginTransmission(address);
+        pWire->write(0x71); // Запрос регистра статуса AHT20
+        if (pWire->endTransmission() == 0) {
+          if (pWire->requestFrom(address, (uint8_t)1) == 1 && pWire->available()) {
+            pWire->read();
+            hardware_verified = true; // Датчик подтвердил свое присутствие
+            
+            if (LOGGING) { Serial.println(F("[Система] - найден прибор 0x38: Датчик AHT20")); }
+            
+            device_AH[0] = 1;
+            device_AH[1] = WIRE_NO;
+            device_AH[2] = PIN_SDA;
+            device_AH[3] = PIN_SCL;
+            device_AH[4] = address;
+          }
+        }
+      }
+
+      // Финальный инкремент счетчика устройств только при успешном прохождении глубокого теста
+      if (hardware_verified) {
+        nDevices++;
+      } else {
+        if (LOGGING) {
+          Serial.print("[Предупреждение] Фантомный ACK на адресе 0x");
+          Serial.print(address, HEX);
+          Serial.println("! Устройство проигнорировано (нет ответа данных).");
+        }
+      }
+    }
+    else if (error == 4) {
+      Serial.print("[Система] Критическая ошибка шины на адресе: 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+    }
+  }
+
+  if (nDevices == 0) {
+    if (LOGGING) {Serial.print("[Система] - I2C устройства не найдены.\n");}
+  }
+
+  // останов шины I2C
+  pWire->end();
+}
+
+void printDeviceTable() {
+  char buf[96]; // Буфер для форматирования строки
+
+  // Чистый заголовок без вертикальных рамок
+  Serial.println(F("=========================================================================="));
+  Serial.println(F("  Устройство   PIN SDA   PIN SCL   Wire No   Address     Имя"));
+  Serial.println(F("--------------------------------------------------------------------------"));
+
+  uint8_t* arrays[] = {device_SI, device_DS, device_AT, device_BM, device_AH, device_DL};
+  const char* names[] = {"device_SI", "device_DS", "device_AT", "device_BM", "device_AH", "device_DL"};
+  String* deviceNames[] = {&device_SI_name, &device_DS_name, &device_AT_name, &device_BM_name,  &device_AH_name, &device_DL_name};
+
+  for (int i = 0; i < 6; i++) {
+    // Если первый элемент (Active) равен 0, пропускаем вывод всей строки
+    if (arrays[i][0] == 0) {
+      continue; 
+    }
+
+    // Выводим данные с фиксированными отступами, а имя просто дописываем в конце
+    snprintf(buf, sizeof(buf), 
+             "  %-10s    %2d        %2d        %d        0x%02X       ", 
+             names[i], 
+             arrays[i][2], // PIN_SDA
+             arrays[i][3], // PIN_SCL
+             arrays[i][1], // WIRE_NO (номер шины)
+             arrays[i][4]);// address
+             
+    Serial.print(buf);
+    Serial.println(*deviceNames[i]); // Выводим String-имя в самый правый край
+  }
+  Serial.println(F("=========================================================================="));
+  
+      LCD_init(true);      
+}
+
