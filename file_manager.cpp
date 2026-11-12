@@ -133,19 +133,9 @@ String my_ax25_invert_var    = "0";      // инверсия тонов
 uint32_t CW_DOT_TIME_MS  = 60;              // Время точки в мс (по умолчанию ~20 WPM)
 volatile uint32_t RTTY_BIT_TIME_US = 22000; // Время одного бита RTTY в мкс (по умолчанию 45.45 Бод)
 
-// НОВЫЕ ДИНАМИЧЕСКИЕ ИНТЕРВАЛЫ КЛИМАТА
-uint32_t climate_sample_interval_min = 10; // По умолчанию замер каждые 10 мин
-uint32_t climate_report_interval_min = 60; // По умолчанию таблица каждый час
-
 int subband_pins[4] = {2, 3, 4, -1};  // пины шифра поддиапазона
 int pin_freq_out = 15;  // выход DDS-генератора
 int pin_amp_act  = 11;  // выход управления усилителем
-// пины включения питания модулей
-// -1 означает NC (Не назначен / Not Connected)
-int pin_pwr_si   = -1;  // генератор SI5351
-int pin_pwr_ds   = -1;  // часы RTC
-int pin_pwr_bm   = -1;  // климатический датчик
-int pin_pwr_dl   = -1;  // дисплей
 
 extern uint16_t rtc_year;  // extern, если объявлены не в этом файле  
 extern uint8_t rtc_month, rtc_day, rtc_hour, rtc_min, rtc_sec;
@@ -514,11 +504,6 @@ static void create_default_fat_with_info_file() {
   content += "[PIN_SUBBAND_1]=" + pin_to_str(subband_pins[1]) + "\r\n";
   content += "[PIN_SUBBAND_2]=" + pin_to_str(subband_pins[2]) + "\r\n";
   content += "[PIN_SUBBAND_3]=" + pin_to_str(subband_pins[3]) + "\r\n\r\n";
-  content += "// Пины питания шины (NC если не назначены)\r\n";
-  content += "[PIN_PWR_SI   ]=" + pin_to_str(pin_pwr_si) + "\r\n";
-  content += "[PIN_PWR_DS   ]=" + pin_to_str(pin_pwr_ds) + "\r\n";
-  content += "[PIN_PWR_BM   ]=" + pin_to_str(pin_pwr_bm) + "\r\n";
-  content += "[PIN_PWR_DL   ]=" + pin_to_str(pin_pwr_dl) + "\r\n\r\n";
   content += "// Дополнительные исключения из сканирования шин\r\n";
   content += "[SCAN_EXCLUDE ]=16,23,24,25\r\n\r\n";
   content += "// Режим отладки: 1 — служебные сообщения в Serial, 0 — выкл\r\n";
@@ -526,9 +511,6 @@ static void create_default_fat_with_info_file() {
   content += "// Управление светодиодной индикацией: 1 — включена, 0 — выключена\r\n";
   content += "[LED_ENABLE]=" + String(led_enable_flag ? 1 : 0) + "\r\n\r\n";
   // СОХРАНЕНИЕ ТЕКУЩИХ ИНТЕРВАЛОВ ПРИ ПЕРЕЗАПИСИ ИЛИ ИНИЦИАЛИЗАЦИИ ДИСКА
-  content += "=== ПЕРИОДИЧНОСТЬ КЛИМАТИЧЕСКОГО МОНИТОРИНГА ===\r\n";
-  content += "[CLIM_SAMPLE_MIN]=" + String(climate_sample_interval_min) + "\r\n";
-  content += "[CLIM_REPORT_MIN]=" + String(climate_report_interval_min) + "\r\n\r\n";
   content += "// Коррекция кварцевого генератора в ppb (применяется при старте)\r\n";  
   content += "[XOSC_PPB]=" + String((long)vfo_xosc_corr_ppb) + "\r\n\r\n";  
   content += "=== СТАТИСТИКА ИЗНОСА ФЛЭШ-ПАМЯТИ ===\r\n";
@@ -831,53 +813,6 @@ void read_and_parse_INFO_txt() {
 }
 
 
-/**  
- * @brief Парсер инженерных настроек файла SET.TXT.  
- *  
- * Побайтово сканирует область данных SET.TXT в RAM-диске (сектор 25 +  
- * `SET_CLUSTERS * SECTOR_SIZE` байт) и извлекает теги вида `[ТЕГ]=значение`.  
- * Логика сканирования идентична @ref read_and_parse_INFO_txt: тег  
- * распознаётся только если '[' стоит в начале области или после  
- * перевода строки/непечатного символа; имя тега ищется динамически  
- * до ']', пробелы выравнивания внутри скобок игнорируются; значение  
- * читается до конца строки с фильтрацией непечатных символов (< 32).  
- *  
- * Распознаваемые теги и их назначение:  
- * - `PIN_FREQ_OUT` — GPIO выхода ВЧ-генератора PIO (дефолт 14);  
- * - `PIN_AMP_ACT` — GPIO активации усилителя мощности (дефолт 15);  
- * - `PIN_SUBBAND_0..3` — 4 пина кода поддиапазона (дефолт 2+k);  
- * - `PIN_PWR_SI/DS/BM/DL` — пины питания модулей Si5351, RTC-часов,  
- *   климат-датчика и дисплея (дефолт -1 = NC);  
- * - `SI5351_CLK_OUT` — выходной канал Si5351 для TX (0..2, дефолт CLK0);  
- * - `LED_ENABLE` — флаг индикаторного светодиода (дефолт включён);  
- * - `SCAN_EXCLUDE` — список I2C-адресов, исключённых из сканера шины;  
- * - `DEBUG` — флаг служебных сообщений (@c debug_flag);  
- * - `CLIM_SAMPLE_MIN`, `CLIM_REPORT_MIN` — интервалы климат-  
- *   мониторинга в минутах (защита от 0 → 1).  
- *  
- * Значения пинов разбираются через @ref parse_pin_value: строка "NC"  
- * или пустое значение превращаются в -1 (цепь не подключена).  
- * Ключевая особенность — защита от сброса в 0: если тег отсутствует  
- * или строка пустая, переменной присваивается жёстко заданный дефолт,  
- * а не ноль, поэтому частично заполненный SET.TXT не ломает схему.  
- *  
- * Перед разбором обнуляет промежуточные строки и глобальные  
- * `scan_exclude_list`, `scan_result_data`, `my_debug_var` — функция  
- * безопасна для повторного вызова при правках файла с ПК.  
- *  
- * Вызывается из @ref init_file_manager (старт), @ref force_reset_to_default_disk  
- * и @ref check_and_handle_pc_changes при обнаружении записи в SET.TXT.  
- *  
- * @note В отличие от парсера INFO.TXT, здесь нет посимвольной цифровой  
- *       фильтрации значений — собираются все печатные символы,  
- *       поэтому "NC" доходит до `parse_pin_value` в исходном виде.  
- * @warning Пины применяются только до следующей инициализации  
- *          периферии; изменение `PIN_FREQ_OUT`/`PIN_AMP_ACT` требует  
- *          рестарта, т.к. GPIO конфигурируются в setup-фазе.  
- *  
- * @see read_and_parse_INFO_txt(), parse_pin_value(), init_file_manager(),  
- *      check_and_handle_pc_changes()  
- */
 void read_and_parse_SET_txt() {
   flash_flush_cache();
   
@@ -924,10 +859,6 @@ void read_and_parse_SET_txt() {
           else if (tag == "PIN_SUBBAND_1")   target_str = &s_subband[1];  
           else if (tag == "PIN_SUBBAND_2")   target_str = &s_subband[2];  
           else if (tag == "PIN_SUBBAND_3")   target_str = &s_subband[3];  
-          else if (tag == "PIN_PWR_SI")      target_str = &s_pwr_si;  
-          else if (tag == "PIN_PWR_DS")      target_str = &s_pwr_ds;  
-          else if (tag == "PIN_PWR_BM")      target_str = &s_pwr_bm;  
-          else if (tag == "PIN_PWR_DL")      target_str = &s_pwr_dl;  
           else if (tag == "SCAN_EXCLUDE")    target_str = &scan_exclude_list;  
           else if (tag == "DEBUG")           target_str = &my_debug_var;
           else if (tag == "CLIM_SAMPLE_MIN") target_str = &s_clim_sample;
@@ -965,21 +896,10 @@ void read_and_parse_SET_txt() {
     subband_pins[k] = (s_subband[k].length() > 0) ? parse_pin_value(s_subband[k]) : (2 + k);
   }
   
-  pin_pwr_si = (s_pwr_si.length() > 0) ? parse_pin_value(s_pwr_si) : -1;
-  pin_pwr_ds = (s_pwr_ds.length() > 0) ? parse_pin_value(s_pwr_ds) : -1;
-  pin_pwr_bm = (s_pwr_bm.length() > 0) ? parse_pin_value(s_pwr_bm) : -1;
-  pin_pwr_dl = (s_pwr_dl.length() > 0) ? parse_pin_value(s_pwr_dl) : -1;
   led_enable_flag = (s_led_enable.length() > 0) ? (s_led_enable.toInt() != 0) : true;
   int parsed_clk = (s_si_clk.length() > 0) ? s_si_clk.toInt() : 0;
   si5351_clk_tx_out = (parsed_clk >= 0 && parsed_clk <= 2) ? parsed_clk : 0;
-  if (s_clim_sample.length() > 0) {
-    uint32_t val = s_clim_sample.toInt();
-    climate_sample_interval_min = (val > 0) ? val : 1; // Защита от 0
-  }
-  if (s_clim_report.length() > 0) {  
-    uint32_t val = s_clim_report.toInt();  
-    climate_report_interval_min = (val > 0) ? val : 1; // Защита от 0  
-  }  
+
   // Коррекция частоты XOSC в ppb (знаковая, ±). Пусто/0 = кварц идеальный.  
   // Применяется через effective_xosc_hz() — формулы clkdiv и таблица тонов  
   // читают её вместо константы XOSC_MHZ*1e6.  
@@ -1035,15 +955,6 @@ void print_current_settings() {
   }
   Serial.println("");
   
-  auto print_pwr_pin = [](const char* label, int pin) {
-    Serial.print("Питание устройства ["); Serial.print(label); Serial.print("]   : ");
-    if (pin == -1) Serial.println("NC (Не назначен)");
-    else Serial.println(pin);
-  };
-  print_pwr_pin("SI", pin_pwr_si);
-  print_pwr_pin("DS", pin_pwr_ds);
-  print_pwr_pin("BM", pin_pwr_bm);
-  print_pwr_pin("DL", pin_pwr_dl);
   // Корректное распознавание флага NC (Not Connected) для списка исключений
   Serial.print("Исключения сканера шины   : "); 
   if (scan_exclude_list.length() == 0 || scan_exclude_list.equalsIgnoreCase("NC")) {
@@ -1498,55 +1409,6 @@ void log_file_write_line(String message) {
 
 
 
-
-
-
-
-
-/**  
- * @brief Сборка и запись актуального содержимого SET.TXT в область данных RAM-диска.  
- *  
- * Формирует файл инженерных настроек заново из текущих глобальных  
- * переменных железа и записывает его в сектор 25 RAM-диска  
- * (@c ram_disk_buffer). Структура документа фиксированная, значения  
- * подставляются из рантайм-переменных:  
- * - пины: `PIN_FREQ_OUT`, `PIN_AMP_ACT`, `PIN_SUBBAND_0..3`,  
- *   `PIN_PWR_SI/DS/BM/DL` — через лямбду @c pin_to_str, превращающую  
- *   -1 в строку "NC";  
- * - `SI5351_CLK_OUT` — активный выходной канал Si5351;  
- * - `SCAN_EXCLUDE` — список исключённых из сканирования пинов I2C;  
- * - `DEBUG`, `LED_ENABLE` — служебные флаги;  
- * - `CLIM_SAMPLE_MIN`, `CLIM_REPORT_MIN` — интервалы климат-мониторинга;  
- * - `FLASH_SLOT`, `FLASH_SEQ` — статистика износа Flash  
- *   (активный слот и счётчик версий);  
- * - `[SCAN_RESULT]` — блок результатов I2C-сканирования из параметра  
- *   @p scan_results.  
- *  
- * После сборки строки файл обрезается до `SET_MAX_BYTES - 10` с  
- * добавлением маркера `[EOF]`, область данных зануляется  
- * (`memset`), содержимое копируется в RAM-диск, а размер файла  
- * обновляется в записи корневого каталога (смещение 32, байты 28-31).  
- *  
- * Завершает работу обновлением метки времени записи SET.TXT  
- * (@ref set_dir_timestamp, индекс 1), сбросом образа во Flash  
- * (@ref save_ram_to_flash) и принудительным перемонтированием тома  
- * на ПК (@ref remount_usb_disk), чтобы хост перечитал изменённый файл.  
- *  
- * @param[in] scan_results  Многострочная строка результатов I2C-  
- *                          сканирования (формируется в @ref I2C_Scanner  
- *                          через @ref fmt_dev). Также сохраняется в  
- *                          глобальную @c scan_result_data.  
- *  
- * @note Функция — зеркало генератора SET.TXT внутри  
- *       @ref create_default_fat_with_info_file: обе собирают один и тот  
- *       же формат, поэтому изменения шаблона нужно вносить в два места.  
- * @warning Вызывает @ref save_ram_to_flash и @ref remount_usb_disk —  
- *          недёшёвый вызов (стирание Flash-слота + переподключение  
- *          USB-MSC); не вызывать в горячем цикле.  
- *  
- * @see I2C_Scanner(), read_and_parse_SET_txt(), create_default_fat_with_info_file(),  
- *      save_ram_to_flash(), remount_usb_disk()  
- */
 void save_hardware_settings_to_file(String scan_results) {
   uint32_t root_offset = SECTOR_SIZE * 2;
   uint32_t set_entry_offset = root_offset + 32; 
@@ -1571,11 +1433,6 @@ void save_hardware_settings_to_file(String scan_results) {
   content += "[PIN_SUBBAND_1]=" + pin_to_str(subband_pins[1]) + "\r\n";
   content += "[PIN_SUBBAND_2]=" + pin_to_str(subband_pins[2]) + "\r\n";
   content += "[PIN_SUBBAND_3]=" + pin_to_str(subband_pins[3]) + "\r\n\r\n";
-  content += "// Пины питания шины (NC если не назначены)\r\n";
-  content += "[PIN_PWR_SI   ]=" + pin_to_str(pin_pwr_si) + "\r\n";
-  content += "[PIN_PWR_DS   ]=" + pin_to_str(pin_pwr_ds) + "\r\n";
-  content += "[PIN_PWR_BM   ]=" + pin_to_str(pin_pwr_bm) + "\r\n";
-  content += "[PIN_PWR_DL   ]=" + pin_to_str(pin_pwr_dl) + "\r\n\r\n";
   content += "// Исключения из сканирования шин\r\n";
   content += "[SCAN_EXCLUDE ]=" + scan_exclude_list + "\r\n\r\n";
   content += "// Режим отладки: 1 — служебные сообщения в Serial, 0 — выкл\r\n";
@@ -1583,9 +1440,6 @@ void save_hardware_settings_to_file(String scan_results) {
   content += "// Управление светодиодной индикацией: 1 — включена, 0 — выключена\r\n";
   content += "[LED_ENABLE]=" + String(led_enable_flag ? 1 : 0) + "\r\n\r\n";
   // СОХРАНЕНИЕ ТЕКУЩИХ ИНТЕРВАЛОВ ПРИ ПЕРЕЗАПИСИ ИЛИ ИНИЦИАЛИЗАЦИИ ДИСКА
-  content += "=== ПЕРИОДИЧНОСТЬ КЛИМАТИЧЕСКОГО МОНИТОРИНГА ===\r\n";
-  content += "[CLIM_SAMPLE_MIN]=" + String(climate_sample_interval_min) + "\r\n";
-  content += "[CLIM_REPORT_MIN]=" + String(climate_report_interval_min) + "\r\n\r\n";  
   content += "[XOSC_PPB      ]=" + String((long)vfo_xosc_corr_ppb) + "\r\n\r\n";
   content += "=== СТАТИСТИКА ИЗНОСА ФЛЭШ-ПАМЯТИ ===\r\n";
   content += "[FLASH_SLOT   ]=" + String(current_active_slot != -1 ? current_active_slot : 0) + "\r\n";
@@ -1628,12 +1482,6 @@ bool is_pin_excluded_from_scan(int pin) {
     if (pin == subband_pins[k]) return true;
   }
 
-  // 3. АВТО-ИСКЛЮЧЕНИЕ: Защищаем пины питания устройств шины (если они назначены, т.е. не равны -1)
-  if (pin_pwr_si != -1 && pin == pin_pwr_si) return true;
-  if (pin_pwr_ds != -1 && pin == pin_pwr_ds) return true;
-  if (pin_pwr_bm != -1 && pin == pin_pwr_bm) return true;
-  if (pin_pwr_dl != -1 && pin == pin_pwr_dl) return true;
-
   // 4. ТЕКСТОВЫЕ ИСКЛЮЧЕНИЯ: Проверяем ручной список SCAN_EXCLUDE (если там не написано "NC" или пусто)
   if (scan_exclude_list.length() == 0 || scan_exclude_list.equalsIgnoreCase("NC")) return false;
   
@@ -1665,12 +1513,6 @@ void force_reset_to_default_disk() {
   subband_pins[3] = 9;
   pin_freq_out = 10;  // выход DDS-генератора
   pin_amp_act  = 11;  // выход управления усилителем
-  // пины включения питания модулей
-  // -1 означает NC (Не назначен / Not Connected)
-  pin_pwr_si   = -1;  // генератор SI5351
-  pin_pwr_ds   = -1;  // часы RTC
-  pin_pwr_bm   = -1;  // климатический датчик
-  pin_pwr_dl   = -1;  // дисплей
 
   // при формате лимиты возвращаются на паспортные:  
   vfo_max_clk_sys_hz = PASSPORT_CLK_SYS_MAX_HZ;  

@@ -163,21 +163,11 @@ void check_serial_commands() {
             print_current_date();
             print_current_time();
             Serial.print(F("Телеметрия: ")); Serial.println(get_telemetry_string());
-            if (device_BM[0] == 1) {
-            }
-            else {
-            Serial.print(F("Телеметрия: ")); Serial.println("в системе отсутствует датчик давления");
-            }
             Serial.println(F("Введите help для перехода в справочное меню по командам управления"));
           }
           else if (command.equalsIgnoreCase("TELE")) {
             print_current_time();
             Serial.print(F("Телеметрия: ")); Serial.println(get_telemetry_string());
-            if (device_BM[0] == 1) {
-            }
-            else {
-            Serial.print(F("Телеметрия: ")); Serial.println("в системе отсутствует датчик давления");
-            }
           }
           else if (command.startsWith("time")) {
             int space_idx = command.indexOf(' ');
@@ -717,11 +707,6 @@ void setup() {
 
   vfo_subband_init();
 
-  // Инициализация пинов питания шин, если они назначены (не равны -1)
-  if (pin_pwr_si != -1) { pinMode(pin_pwr_si, OUTPUT); digitalWrite(pin_pwr_si, LOW); }
-  if (pin_pwr_ds != -1) { pinMode(pin_pwr_ds, OUTPUT); digitalWrite(pin_pwr_ds, HIGH); } // Часы обычно всегда запитаны
-  if (pin_pwr_bm != -1) { pinMode(pin_pwr_bm, OUTPUT); digitalWrite(pin_pwr_bm, LOW); }
-  if (pin_pwr_dl != -1) { pinMode(pin_pwr_dl, OUTPUT); digitalWrite(pin_pwr_dl, LOW); }
   // ПРАВКА: Инициализация динамического пина активации УМ из файла SET.TXT
   if (pin_amp_act != -1) {
     pinMode(pin_amp_act, OUTPUT);
