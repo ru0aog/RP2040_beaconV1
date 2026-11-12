@@ -459,8 +459,8 @@ static void create_default_fat_with_info_file() {
     "// Формат одиночной:     [TASK_01]=ДНИ,ЧЧ:ММ,ЧАСТОТА_ГЦ,МОДА\r\n"
     "// Формат периодической: [TASK_01]=ДНИ,ЧЧ:ММ_СТАРТ/ЧЧ:ММ_КОНЕЦ/ИНТЕРВАЛ,ЧАСТОТА_ГЦ,МОДА\r\n"
     "// Базовое расписание (Ежедневно) ---\r\n"
-    "// Плотный дневной цикл каждые 5 минут (с 09:00 до 22:00 ежедневно) ---\r\n"
-    "// [TASK_01]=0,09:00/22:00/5,3591500,RTTY\r\n"
+    "// Плотный круглосуточный цикл каждую 1 минуту (с 00:00 до 23:59 ежедневно) ---\r\n"
+    "[TASK_01]=0,00:00/23:59/1,3601500,CW\r\n"
     "// [TASK_02]=0,15:18,3601585,CW\r\n"
     "// [TASK_03]=0,15:20,3601307,IFKP\r\n"
     "// Примеры:\r\n"
@@ -861,8 +861,6 @@ void read_and_parse_SET_txt() {
           else if (tag == "PIN_SUBBAND_3")   target_str = &s_subband[3];  
           else if (tag == "SCAN_EXCLUDE")    target_str = &scan_exclude_list;  
           else if (tag == "DEBUG")           target_str = &my_debug_var;
-          else if (tag == "CLIM_SAMPLE_MIN") target_str = &s_clim_sample;
-          else if (tag == "CLIM_REPORT_MIN") target_str = &s_clim_report;
           else if (tag == "XOSC_PPB")        target_str = &s_xosc_ppb;
 
           if (target_str != nullptr) {  
