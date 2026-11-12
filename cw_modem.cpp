@@ -28,24 +28,6 @@
  *  Символы переводятся в верхний регистр. Встретившийся знак переноса строки '\n'  
  *  автоматически заменяется стандартным знаком раздела Морзе '=' (-...-).  
  *  
- *  КОНТРОЛЬ ДРЕЙФА И ОПРОС КОНСОЛИ  
- *  -------------------------------  
- *  Функция cw_delay(ms) контролирует интервалы через micros(), устраняя  
- *  накопление временной погрешности (дрейфа скорости). Если длительность паузы  
- *  более 15 мс, в цикл встраивается вызов check_serial_commands() и watchdog_update(). 
- *  
- *  ОБРАБОТКА ТЕКСТА (send_cw_string)  
- *  ---------------------------------  
- *  Символы приводятся к верхнему регистру; '\r' пропускается; '\n' заменяется  
- *  на разделитель '=' (код -...-); ' ' даёт межсловную паузу. Каждый знак  
- *  ищется в таблице Морзе morse_table (A-Z, 0-9, . , ? / - = !) и параллельно  
- *  дублируется в Serial и на LCD (LCD_push_char). Индикация посылок — светодиоды  
- *  LED_BUILTIN и ZERO_LED_RED.  
- *  
- *  СТРУКТУРЫ:  
- *    struct cw_map_t { char c; const char* morse; } — элемент таблицы Морзе  
- *        «символ -> строка из точек/тире».  
- *  
  *  API:  
  *    prepare_cw_frequency(freq_hz)     — установка частоты несущей (Si5351 или  
  *                                        программный VFO на PIO).  
@@ -71,7 +53,6 @@
 #include "si5351_driver.h"
 #include "scheduler.h"
 #include "file_manager.h"
-#include "lcd.h"
 #include "vfo_hardware.h"
 #include "led_blink.h"
 #include "thor_modem.h"
@@ -210,7 +191,6 @@ void send_cw_string(const char* str) {
         else if (c == ' ') {
             // 3. Обработка чистого знака пробела (стандартная пауза между словами = 7 точек)
             Serial.print(" ");
-            LCD_push_char(' ', 0, 16);
             cw_delay(CW_DOT_TIME_MS * 4); // 3 (из элемента) + 4 = 7 точек паузы
             continue;
         }
@@ -219,8 +199,6 @@ void send_cw_string(const char* str) {
         for (int j = 0; morse_table[j].c != 0; j++) {
             if (morse_table[j].c == c) {
                 Serial.print(morse_table[j].c);
-
-                LCD_push_char(morse_table[j].c, 0, 16);
 
                 Serial.flush();
 

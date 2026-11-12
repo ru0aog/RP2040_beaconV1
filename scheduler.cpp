@@ -69,7 +69,6 @@
 #include "scheduler.h"
 #include "file_manager.h" // Доступ к константам и структуре TaskItem
 #include "si5351_driver.h"
-#include "climate_log.h"
 #include "vfo_hardware.h"
 
 extern int pin_amp_act;          // Динамический пин активации УМ из file_manager.cpp
@@ -402,8 +401,6 @@ void update_scheduler() {
       rtc_year  = currentTime.year;
     }
   }
-  // обновить лог климата
-  climate_log_update();
 }
 
 
